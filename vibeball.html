@@ -718,7 +718,7 @@ function updateFlightSound() {
 // --- Lógica de jogo ------------------------------------------------------
 function speed() {
   // a velocidade acompanha parcialmente o comprimento do túnel
-  const base = Math.min(1.85 + 0.17 * (G.level - 1), 4.8) * Math.pow(TD / TD_BASE, TUN.speedExp);
+  const base = Math.min(1.85 + 0.17 * (G.level - 1), 4.8) * (1 + 0.012 * OVR(G.level)) * Math.pow(TD / TD_BASE, TUN.speedExp);
   // squash: o percurso é o dobro (ida à parede e volta) → bola mais rápida
   return base * (SQUASH ? 1.45 : 1) * (1 + Math.min(G.rally, 12) * 0.025);   // a bola acelera ligeiramente durante a jogada
 }
@@ -955,7 +955,8 @@ function oppHit(weak, isServe) {
     if (stl === 'sobe')   { ty = rnd(-0.5, -0.3); cy = -ce * rnd(0.2, 0.5); }       // sai baixo e sobe
     if (stl === 'canto')  { tx = sd * rnd(0.45, 0.65); ty = sv * rnd(0.25, 0.45); sm *= 1.05; }
     if (stl === 'efeito') { tx = -sd * rnd(0.1, 0.35); cx = sd * ce * rnd(0.6, 1); cy = rnd(-0.3, 0.3); }   // curva para o lado
-    ball.vz = -speed() * sm;
+    // penáltis: o remate do adversário não passa da velocidade de ~nível 9 (defender tem de ser possível)
+    ball.vz = -(PENALTY ? Math.min(speed(), TUN.penShotCap * (1 + 0.01 * OVR(G.level)) * Math.pow(TD / TD_BASE, TUN.speedExp)) : speed()) * sm;
     const tfs = TD / Math.abs(ball.vz);
     // aponta descontando a deriva do efeito (a bola chega perto do alvo, mas a curva vê-se)
     ball.vx = clamp((tx - ball.x) / tfs - 0.5 * cx * tfs * 0.6, -1.3, 1.3);
@@ -1142,12 +1143,14 @@ function hitTest(p) {
 //    puxá-lo para um lado e jogar rápido para o outro é a forma de lhe ganhar pontos.
 //  · Erra mais com bolas rápidas, com efeito e em jogadas longas (cansaço).
 // =========================================================================
-const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2, penAnt0: 0, penAntL: 0, penAntMax: 0, penRead0: 0.08, penReadL: 0.015, penReadMax: 0.3, penErr: 3, penReady: 0, penSpd: 0.75 };   // calibração por comprimento do túnel
+const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2, penAnt0: 0, penAntL: 0, penAntMax: 0, penRead0: 0.08, penReadL: 0.015, penReadMax: 0.3, penReady: 0, penSpd0: 0.7, penSpdL: 0.008, penSpdMax: 0.8, penErr0: 3.2, penErrL: 0.04, penErrMin: 2.6, penShotCap: 3.2 };   // calibração por comprimento do túnel
+// depois do nível 22 (onde tudo atinge o máximo) a dificuldade continua a subir devagar, sem limite
+const OVR = L => Math.max(0, L - 22);
 const AI = {
-  skill: L => Math.min(0.8, 0.14 + 0.05 * (L - 1)),      // leitura do jogo (0..1) — cresce até ~nível 15
-  vmax:  L => Math.min(0.68 + 0.085 * (L - 1), 1.95),     // velocidade máxima
-  amax:  L => Math.min(2.4 + 0.36 * (L - 1), 7.5),          // aceleração máxima (inércia)
-  react: L => Math.max(0.06, 0.22 - 0.012 * (L - 1)),     // tempo de reação a cada bola
+  skill: L => Math.min(0.8, 0.14 + 0.05 * (L - 1)) + Math.min(0.15, 0.006 * OVR(L)),   // leitura do jogo (0..1)
+  vmax:  L => Math.min(0.68 + 0.085 * (L - 1), 1.95) * (1 + 0.03 * OVR(L)),            // velocidade máxima
+  amax:  L => Math.min(2.4 + 0.36 * (L - 1), 7.5) * (1 + 0.03 * OVR(L)),               // aceleração máxima (inércia)
+  react: L => Math.max(0.06, 0.22 - 0.012 * (L - 1)) / (1 + 0.03 * OVR(L)),            // tempo de reação a cada bola
   recover: 0.55                                            // velocidade relativa de recuperação para o centro
 };
 let aiPlanT = 0;
@@ -1200,10 +1203,10 @@ function aiPlan(fresh, isServe) {
     // adivinha o teu serviço: cada vez mais vezes com o nível e, sobretudo, depois de ases seguidos
     op.antic = isServe && G.server !== 'op' && Math.random() < (PENALTY
       ? Math.min(TUN.penAnt0 + TUN.penAntL * (L - 1), TUN.penAntMax)          // penáltis: adivinha menos (marcar tem de ser possível)
-      : Math.min(Math.min(TUN.antL0 + TUN.antL * (L - 1), TUN.antMax) + TUN.aceRun * Math.min(G.aceRun || 0, 3), 0.93));
+      : Math.min(Math.min(TUN.antL0 + TUN.antL * (L - 1), TUN.antMax) + Math.min(0.12, 0.006 * OVR(L)) + TUN.aceRun * Math.min(G.aceRun || 0, 3), 0.93));
     if (isServe) {   // à espera do serviço: mais atento — cada vez mais com o nível (ases um pouco mais difíceis)
       const ready = Math.min(1, (L - 1) / 10) * (PENALTY ? TUN.penReady : 1);
-      if (PENALTY) { op.ex *= TUN.penErr; op.ey *= TUN.penErr; }               // penáltis: mais erro do guarda-redes
+      if (PENALTY) { const pe = Math.max(TUN.penErr0 - TUN.penErrL * (L - 2), TUN.penErrMin) / (1 + 0.03 * OVR(L)); op.ex *= pe; op.ey *= pe; }               // penáltis: mais erro do guarda-redes
       op.react *= 0.6 - 0.25 * ready; op.ex *= 0.7 - 0.3 * ready; op.ey *= 0.7 - 0.3 * ready;
     }
     if (op.read) { op.react = 0; op.ex *= 0.5; op.ey *= 0.5; }
@@ -1226,7 +1229,7 @@ function aiUpdate(dt) {
   // a receber o teu serviço: se adivinhou o serviço (op.antic), arranca muito mais depressa para lá
   if (G.mode === 'play' && G.rally === 0 && G.server !== 'op' && aiIncoming()) {
     if (op.antic) { vm *= 1 + TUN.antBoost; am *= 1 + TUN.antBoost; }
-    if (PENALTY) { vm *= TUN.penSpd; am *= TUN.penSpd; }                 // penáltis: guarda-redes um pouco mais lento
+    if (PENALTY) { const ps = Math.min(TUN.penSpd0 + TUN.penSpdL * (L - 2), TUN.penSpdMax) * (1 + 0.015 * OVR(L)); vm *= ps; am *= ps; }   // penáltis: guarda-redes mais lento, melhora com o nível
   }
   let tx, ty;
   if (G.mode === 'play' && aiIncoming()) {

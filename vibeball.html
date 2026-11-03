@@ -1440,9 +1440,9 @@ function update(dt) {
         if (!PEN.rip) { PEN.rip = { x: clamp(ball.x, -GX, GX), y: clamp(ball.y, -GY, TY), t: 0 }; sfx.goal(); }
         PEN.rip.t += dt;
         ball.vz = 0; ball.vx *= 0.9; ball.vy = ball.vy * 0.9 + 0.6 * dt; ball.cx = ball.cy = 0;
-        ball.z = TD + 0.2 + Math.max(0, netBulge(ball.x, ball.y));
+        ball.z = TD + 0.2 + Math.max(0, netBulge(ball.x, ball.y)) * 0.9;
       }
-      if (ball.z < -0.45 || ball.z > TD + 0.6) ball.visible = false;
+      if (ball.z < -0.45 || ball.z > TD + (PENALTY ? 1.3 : 0.6)) ball.visible = false;
       G.timer -= dt;
       if (G.timer <= 0) {
         if (G.after === 'gameover') {
@@ -1498,7 +1498,7 @@ function update(dt) {
 
   updateFire(dt);
   updateGlitch(dt);
-  if (NET && NET.rip) { NET.rip.t += dt; if (NET.rip.t > 1.6) NET.rip = null; }
+  if (NET && NET.rip) { NET.rip.t += dt; if (NET.rip.t > 2.8) NET.rip = null; }
   if (ballHue !== ballHueTarget) {        // transição gradual da cor (pelo caminho mais curto no círculo)
     let dh = ((ballHueTarget - ballHue + 540) % 360) - 180;
     ballHue = (ballHue + dh * (1 - Math.exp(-dt * 2.2)) + 360) % 360;
@@ -1557,8 +1557,10 @@ const GX = TX - 0.03, GY = TY - 0.03, GPR = 0.02;    // postes (x = ±GX), trave
 // ondulação da rede depois do golo (empurrada para trás no ponto onde a bola entrou)
 function netBulge(x, y) {
   const r = PEN.rip; if (!r) return 0;
-  const g = Math.exp(-((x - r.x) ** 2 + (y - r.y) ** 2) / 0.14);
-  return 0.24 * g * (1 - Math.exp(-r.t * 22)) * Math.exp(-2.2 * r.t) * Math.cos(8 * r.t);
+  const g = Math.exp(-((x - r.x) ** 2 + (y - r.y) ** 2) / 0.32);
+  const on = 1 - Math.exp(-r.t * 18);
+  return on * (0.5 * g * Math.exp(-1.4 * r.t) * Math.cos(6.5 * r.t)          // saco no ponto do impacto
+             + 0.1 * Math.exp(-1.2 * r.t) * Math.cos(5 * r.t + 0.6) * (0.6 + 0.4 * Math.cos(x * 2.2)));   // toda a rede a balançar
 }
 // bola nos ferros: decide se entra ou sai (como no futebol). Devolve true se tocou.
 function penWoodwork() {
@@ -2382,7 +2384,7 @@ function drawGoal() {
   // rede do fundo: malha em losango (ondula com o golo)
   ctx.strokeStyle = 'rgba(235,240,245,0.3)'; ctx.lineWidth = 1;
   ctx.beginPath();
-  const st = 2 * GX / 28, n = PEN.rip ? 12 : 1;
+  const st = 2 * GX / 28, n = PEN.rip ? 18 : 1;
   for (const sg of [1, -1]) {               // famílias x − y = c e x + y = c
     for (let c = -(GX + TY) - st; c <= GX + TY + st; c += st) {
       // segmento da reta dentro do retângulo [-GX, GX] × [-GY, TY]
@@ -2392,7 +2394,8 @@ function drawGoal() {
       if (x1 <= x0) continue;
       for (let i = 0; i <= n; i++) {
         const x = x0 + (x1 - x0) * i / n, y = sg === 1 ? x - c : c - x;
-        const q = P(x, y, zr + netBulge(x, y));
+        const bz = netBulge(x, y), k = clamp(bz * 2.4, -0.25, 0.65), r = PEN.rip;   // a malha é puxada para o ponto do impacto
+        const q = r ? P(x + (r.x - x) * k, y + (r.y - y) * k + Math.abs(bz) * 0.3, zr + bz) : P(x, y, zr);
         if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
       }
     }
@@ -2404,7 +2407,7 @@ function drawGoal() {
   for (let k = 0; k <= 6; k++) {
     const u = k / 6, yy = -GY + u * (TY + GY), xx = -GX + u * 2 * GX;
     for (const [x1, y1] of [[-GX, yy], [GX, yy], [xx, -GY]]) {
-      const p1 = P(x1, y1, TD), p2 = P(x1, y1, zr + netBulge(x1, y1) * 0.4);
+      const p1 = P(x1, y1, TD), p2 = P(x1, y1, zr + netBulge(x1, y1) * 0.8);
       ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
     }
   }
@@ -2426,17 +2429,20 @@ function drawGoal() {
 // rede do meio a abanar depois de a bola lá bater (empurrada no sentido da bola, amortece)
 function netWave(x, y) {
   const r = NET && NET.rip; if (!r) return 0;
-  const g = Math.exp(-((x - r.x) ** 2 + (y - r.y) ** 2) / 0.09);
-  return r.d * 0.075 * g * (1 - Math.exp(-r.t * 30)) * Math.exp(-3 * r.t) * Math.cos(12 * r.t);
+  const g = Math.exp(-((x - r.x) ** 2 + (y - r.y) ** 2) / 0.22);
+  const fix = clamp((TY - y) / (TY - NET.top), 0, 1);                          // presa no chão, solta em cima
+  const on = 1 - Math.exp(-r.t * 25);
+  return r.d * on * fix * (0.2 * g * Math.exp(-1.8 * r.t) * Math.cos(9 * r.t)
+                         + 0.06 * Math.exp(-1.5 * r.t) * Math.cos(7 * r.t + 0.5) * (0.5 + 0.5 * Math.cos((x - r.x) * 2.5)));
 }
 function drawNet() {
   if (!NET) return;
   const zm = TD / 2, top = NET.top;
   const a = P(-TX, top, zm), b = P(TX, TY, zm);
-  const wv = !!NET.rip, NX = wv ? 24 : 1, NY = wv ? 8 : 1;
+  const wv = !!NET.rip, NX = wv ? 30 : 1, NY = wv ? 10 : 1;
   const line = (x0, y0, x1, y1, n) => {
     for (let i = 0; i <= n; i++) {
-      const x = x0 + (x1 - x0) * i / n, y = y0 + (y1 - y0) * i / n, q = P(x, y, zm + netWave(x, y));
+      const x = x0 + (x1 - x0) * i / n, y = y0 + (y1 - y0) * i / n, w = netWave(x, y), q = P(x, y + Math.abs(w) * 0.45, zm + w);
       if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
     }
   };
@@ -2466,7 +2472,7 @@ function drawBall() {
   if (r < 0.5) return;
   const depth = clamp(ball.z / TD, 0, 1);
   ctx.save();
-  ctx.globalAlpha = (G.mode === 'boom' ? 1 : ball.z > TD ? clamp(1 - (ball.z - TD) / 0.6, 0, 1) : 1) * fogAt(Math.min(ball.z, TD));
+  ctx.globalAlpha = (G.mode === 'boom' ? 1 : ball.z > TD ? clamp(1 - (ball.z - TD) / (PENALTY ? 1.4 : 0.6), 0, 1) : 1) * fogAt(Math.min(ball.z, TD));
   const h = Math.round(ballHue);
   ctx.shadowColor = `hsla(${h},100%,65%,0.8)`;
   ctx.shadowBlur = r * 0.9;

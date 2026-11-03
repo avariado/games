@@ -1142,7 +1142,7 @@ function hitTest(p) {
 //    puxá-lo para um lado e jogar rápido para o outro é a forma de lhe ganhar pontos.
 //  · Erra mais com bolas rápidas, com efeito e em jogadas longas (cansaço).
 // =========================================================================
-const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2 };   // calibração por comprimento do túnel
+const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2, penAnt0: 0, penAntL: 0, penAntMax: 0, penRead0: 0.08, penReadL: 0.015, penReadMax: 0.3, penErr: 3, penReady: 0, penSpd: 0.75 };   // calibração por comprimento do túnel
 const AI = {
   skill: L => Math.min(0.8, 0.14 + 0.05 * (L - 1)),      // leitura do jogo (0..1) — cresce até ~nível 15
   vmax:  L => Math.min(0.68 + 0.085 * (L - 1), 1.95),     // velocidade máxima
@@ -1194,11 +1194,16 @@ function aiPlan(fresh, isServe) {
       op.ex += (Math.random() < 0.5 ? -1 : 1) * rnd(0.28, 0.45); }
     op.react = AI.react(L) * Math.sqrt(TD / TD_BASE) * (SQUASH ? 1.4 : 1);   // túnel curto: reage mais depressa
     // serviço: quanto mais alto o nível, mais vezes "lê" o serviço logo à partida (arranca já para o lado certo)
-    op.read = isServe && Math.random() < Math.min(0.15 + 0.09 * (L - 1), 0.9);
+    op.read = isServe && Math.random() < (PENALTY && G.server !== 'op'
+      ? Math.min(TUN.penRead0 + TUN.penReadL * (L - 1), TUN.penReadMax)       // penáltis: lê pior o teu remate
+      : Math.min(0.15 + 0.09 * (L - 1), 0.9));
     // adivinha o teu serviço: cada vez mais vezes com o nível e, sobretudo, depois de ases seguidos
-    op.antic = isServe && G.server !== 'op' && Math.random() < Math.min(Math.min(TUN.antL0 + TUN.antL * (L - 1), TUN.antMax) + TUN.aceRun * Math.min(G.aceRun || 0, 3), 0.93);
+    op.antic = isServe && G.server !== 'op' && Math.random() < (PENALTY
+      ? Math.min(TUN.penAnt0 + TUN.penAntL * (L - 1), TUN.penAntMax)          // penáltis: adivinha menos (marcar tem de ser possível)
+      : Math.min(Math.min(TUN.antL0 + TUN.antL * (L - 1), TUN.antMax) + TUN.aceRun * Math.min(G.aceRun || 0, 3), 0.93));
     if (isServe) {   // à espera do serviço: mais atento — cada vez mais com o nível (ases um pouco mais difíceis)
-      const ready = Math.min(1, (L - 1) / 10);
+      const ready = Math.min(1, (L - 1) / 10) * (PENALTY ? TUN.penReady : 1);
+      if (PENALTY) { op.ex *= TUN.penErr; op.ey *= TUN.penErr; }               // penáltis: mais erro do guarda-redes
       op.react *= 0.6 - 0.25 * ready; op.ex *= 0.7 - 0.3 * ready; op.ey *= 0.7 - 0.3 * ready;
     }
     if (op.read) { op.react = 0; op.ex *= 0.5; op.ey *= 0.5; }
@@ -1221,6 +1226,7 @@ function aiUpdate(dt) {
   // a receber o teu serviço: se adivinhou o serviço (op.antic), arranca muito mais depressa para lá
   if (G.mode === 'play' && G.rally === 0 && G.server !== 'op' && aiIncoming()) {
     if (op.antic) { vm *= 1 + TUN.antBoost; am *= 1 + TUN.antBoost; }
+    if (PENALTY) { vm *= TUN.penSpd; am *= TUN.penSpd; }                 // penáltis: guarda-redes um pouco mais lento
   }
   let tx, ty;
   if (G.mode === 'play' && aiIncoming()) {
@@ -2547,9 +2553,9 @@ function drawHUD() {
         const x = x0 + i * sp, v = arr[i];
         ctx.beginPath(); ctx.arc(x, y, rr, 0, Math.PI * 2);
         if (v === true) { ctx.fillStyle = `rgb(${rgb})`; ctx.fill(); }
-        else { ctx.strokeStyle = `rgba(${rgb},0.6)`; ctx.lineWidth = 1.2; ctx.stroke(); }
-        if (v === false) {
-          ctx.strokeStyle = 'rgba(255,90,90,0.95)'; ctx.lineWidth = 2;
+        else if (v === undefined) { ctx.strokeStyle = `rgba(${rgb},0.6)`; ctx.lineWidth = 1.2; ctx.stroke(); }
+        if (v === false) {                       // falhado: cruz branca bem visível (em ambas as linhas)
+          ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = 2.4;
           ctx.beginPath(); ctx.moveTo(x - rr, y - rr); ctx.lineTo(x + rr, y + rr); ctx.moveTo(x + rr, y - rr); ctx.lineTo(x - rr, y + rr); ctx.stroke();
         }
       }

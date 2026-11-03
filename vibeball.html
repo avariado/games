@@ -146,6 +146,11 @@ function headFrom(fx, fy) {
 // Sem bloqueio (plano B): ganho de 1,15 → a raquete chega aos limites antes de o cursor chegar à borda.
 const LOCK = { on: false, x: 0, y: 0, lostAt: 0, since: 0, ax: 0, ay: 0, pending: false };
 const NO_LOCK = /nolock/.test(location.search);   // ?nolock desativa o bloqueio (testes)
+// testes: ?modo=alvo|penaltis|squash|rede|disco|crono força esse modo em todos os níveis; ?nivel=N começa no nível N
+const QS = new URLSearchParams(location.search);
+const FORCE_MODE = QS.get('modo') || null;
+const START_LEVEL = Math.max(1, parseInt(QS.get('nivel')) || 1);
+const FORCE_IDX = { squash: 0, penaltis: 1, rede: 2, disco: 3, crono: 4, alvo: 5 }[FORCE_MODE];
 const MOUSE_GAIN = 1.15, MOUSE_SENS = 1.1;
 function requestLock() {
   if (NO_LOCK || document.pointerLockElement === cv || !cv.requestPointerLock) return;
@@ -654,6 +659,24 @@ const sfx = {
       [659.25, 830.6, 987.8].forEach((f, i) => bell(dst, t + 0.32 + i * 0.09, f, 0.6, 0.16));
     } catch (e) {}
   },
+  target(pts) {   // bola cravada no alvo: pancada seca + vibração; o centro dá um sino
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001, d = out(ball.x / TX, 0.5);
+      noise(d, t, 'lowpass', 1400, 0.8, 0.09, 0.8, 300); tone(d, t, 'sine', 210, 120, 0.25, 0.5);
+      tone(d, t + 0.01, 'triangle', 95, 88, 0.4, 0.18);                       // vibração do alvo
+      if (pts === 10) { const dst = out(0, 0); [880, 1318.5, 1760].forEach((f, i) => bell(dst, t + 0.12 + i * 0.08, f, 0.7, 0.16)); }
+      else if (pts >= 6) bell(out(0, 0), t + 0.1, 880 + pts * 40, 0.4, 0.1);
+    } catch (e) {}
+  },
+  tick(last) {   // tique-taque dos últimos segundos
+    if (!audioOn()) return;
+    try { const t = AC.currentTime + 0.001, d = out(0, 0); tone(d, t, 'square', last ? 2200 : 1600, last ? 2200 : 1600, 0.035, 0.12); noise(d, t, 'highpass', 5000, 0.7, 0.02, 0.15); } catch (e) {}
+  },
+  timeUp() {     // tempo esgotado: buzina curta
+    if (!audioOn()) return;
+    try { const t = AC.currentTime + 0.001, d = out(0, 0); tone(d, t, 'sawtooth', 220, 180, 0.35, 0.16); tone(d, t, 'sawtooth', 233, 190, 0.35, 0.12); } catch (e) {}
+  },
   woodwork() {   // bola no poste/trave: "clang" metálico com ressonância
     if (!audioOn()) return;
     try {
@@ -752,11 +775,17 @@ function newGame() {
   themeIdx = 0; themePending = null; visIdx = 1; visPending = null; NET = null;
   buildVerb(TD_BASE);
   shotMemory.length = 0; op.fam = 0;
-  G.score = 0; G.level = 1; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.aceRun = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
-  SQUASH = false; squashPending = false; PENALTY = false; penPending = false; penReset();
+  G.score = 0; G.level = START_LEVEL; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.aceRun = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
+  SQUASH = false; squashPending = false; PENALTY = false; penPending = false; penReset(); DISCO = false; discoPending = false; TIMED = false; timedPending = false; TM.kind = ''; TARGET = false; targetPending = false; tgReset();
+  if (FORCE_IDX !== undefined) {                  // modo forçado (testes): já desde o primeiro nível
+    const mi = FORCE_IDX;
+    SQUASH = squashPending = mi === 0; PENALTY = penPending = mi === 1;
+    NET = netPending = mi === 2 ? { top: TY - 0.42 } : null;
+    DISCO = discoPending = mi === 3; TIMED = timedPending = mi === 4; TARGET = targetPending = mi === 5;
+  }
   G.pops.length = 0; G.served = 0;
   op.x = op.y = 0;
-  banner('NÍVEL 1', '', 1.4);
+  banner('NÍVEL ' + G.level, '', 1.4);
   toServe();
 }
 function toServe(keepFaults) {
@@ -771,7 +800,8 @@ function toServe(keepFaults) {
   ball.vx = ball.vy = ball.vz = 0; ball.cx = ball.cy = 0;
   ball.visible = true;
   // a bola fica parada no centro do plano frontal; a raquete move-se livremente
-  G.server = PENALTY ? PEN.turn : (G.nextServer || 'me');
+  G.server = PENALTY ? PEN.turn : TARGET ? 'me' : (G.nextServer || 'me');
+  TG.stuck = null;
   ball.x = 0; ball.y = 0; ball.z = BR + 0.005;
   if (G.server === 'op') { ball.z = SQUASH ? SQZ + BR + 0.01 : TD - BR - 0.005; G.opServe = { t: rnd(0.9, 1.4), toss: false, vy: 0 }; }
 }
@@ -842,7 +872,9 @@ function serve() {
   ball.vx += clamp(v.x * 0.13, -0.75, 0.75); ball.vy += clamp(v.y * 0.1, -0.5, 0.5);
   // orientação vertical conforme a altura da bola no momento do golpe: alta → para baixo; baixa → para cima
   ball.vy += clamp(-tossY * 1.4, -0.7, 0.7);
+  if (TARGET) { const ck = tgCurveK(); ball.cx *= ck; ball.cy *= ck; }   // tiro ao alvo: menos desvio por efeito
   G.mode = 'play'; G.served++; G.lastBlock = pw < 0.15; G.turn = 'op';
+  if (TIMED) tmStart('point');                 // cronometrado: a partir do teu serviço
   aiObserve(true);
   G.oppAttack = G.lastBlock && G.level >= 2 && Math.random() < 0.6;
   rigOp.hard = G.oppAttack;
@@ -867,6 +899,7 @@ function strike() {
 function playerHit(hp) {
   G.turn = 'op';
   const penSave = PENALTY && G.server === 'op';          // defendeste o penálti do adversário
+  if (TIMED && TM.kind !== 'point') tmStart('point');    // cronometrado: no serviço dele, conta a partir da tua devolução
   ball.z = Math.abs(ball.z);              // reflexão no plano da raquete
   const v = strokeGesture();
   const pw = strokePower(v);
@@ -946,17 +979,24 @@ function oppHit(weak, isServe) {
   }
   if (isServe) {
     // serviço do adversário: varia o tipo — plano, a descer, a subir, ao canto ou com efeito lateral
-    const styles = ['plano', 'desce', 'sobe', 'canto', 'efeito', 'parede', 'parede'];
+    const styles = PENALTY ? ['canto', 'canto', 'canto', 'efeito', 'parede', 'desce', 'sobe']   // penáltis: remates colocados
+                           : ['plano', 'desce', 'sobe', 'canto', 'efeito', 'parede', 'parede'];
     const stl = styles[Math.floor(Math.random() * styles.length)];
     const sd = Math.random() < 0.5 ? -1 : 1, sv = Math.random() < 0.5 ? -1 : 1;
-    const ce = Math.min(0.5 + 0.08 * (L - 1), 1.8);            // efeito máximo (cresce com o nível)
+    const ce = Math.min(0.5 + 0.08 * (L - 1), 1.8) * (PENALTY ? 1.3 : 1);   // efeito máximo (cresce com o nível)
     let tx = rnd(-0.35, 0.35), ty = rnd(-0.2, 0.2), cx = 0, cy = 0, sm = rnd(0.92, 1.08);
     if (stl === 'desce')  { ty = rnd(0.3, 0.5);   cy = ce * rnd(0.3, 0.7); }        // bate no alto e cai a pique
     if (stl === 'sobe')   { ty = rnd(-0.5, -0.3); cy = -ce * rnd(0.2, 0.5); }       // sai baixo e sobe
     if (stl === 'canto')  { tx = sd * rnd(0.45, 0.65); ty = sv * rnd(0.25, 0.45); sm *= 1.05; }
+    if (PENALTY) {                                               // penálti: mais longe do centro e mais forte
+      if (stl === 'canto') { tx = sd * rnd(0.6, 0.85); ty = sv * rnd(0.35, 0.6); }
+      else if (stl !== 'efeito') tx = sd * rnd(0.35, 0.7);
+      sm *= rnd(1.05, 1.15);
+    }
     if (stl === 'efeito') { tx = -sd * rnd(0.1, 0.35); cx = sd * ce * rnd(0.6, 1); cy = rnd(-0.3, 0.3); }   // curva para o lado
-    // penáltis: o remate do adversário não passa da velocidade de ~nível 9 (defender tem de ser possível)
-    ball.vz = -(PENALTY ? Math.min(speed(), TUN.penShotCap * (1 + 0.01 * OVR(G.level)) * Math.pow(TD / TD_BASE, TUN.speedExp)) : speed()) * sm;
+    // penáltis: o remate do adversário é sempre forte (no mínimo ~nível 7) mas não passa de ~nível 13 (defender tem de ser possível)
+    const tdk = Math.pow(TD / TD_BASE, TUN.speedExp);
+    ball.vz = -(PENALTY ? clamp(speed(), TUN.penShotMin * tdk, TUN.penShotCap * (1 + 0.01 * OVR(G.level)) * tdk) : speed()) * sm;
     const tfs = TD / Math.abs(ball.vz);
     // aponta descontando a deriva do efeito (a bola chega perto do alvo, mas a curva vê-se)
     ball.vx = clamp((tx - ball.x) / tfs - 0.5 * cx * tfs * 0.6, -1.3, 1.3);
@@ -996,7 +1036,7 @@ function serveFault() {
 // --- Bumerangue (raro e inesperado): numa bola que o adversário falha, a bola segue até ao "infinito",
 // faz a curva e volta em arco para ti; o jogo continua. Se voltares a ganhar o ponto, vale pontos extra.
 function tryBoomerang() {
-  if (G.boomUsed || G.warp || PENALTY || Math.random() > 0.085) return false;
+  if (G.boomUsed || G.warp || PENALTY || TARGET || Math.random() > 0.085) return false;
   G.boomUsed = true; G.boomBonus = true;
   const sp = Math.max(ball.vz, speed());
   G.boom = { t: 0, z0: ball.z, x0: ball.x, y0: ball.y, ex: rnd(-0.5, 0.5), ey: rnd(-0.35, 0.3),
@@ -1143,7 +1183,7 @@ function hitTest(p) {
 //    puxá-lo para um lado e jogar rápido para o outro é a forma de lhe ganhar pontos.
 //  · Erra mais com bolas rápidas, com efeito e em jogadas longas (cansaço).
 // =========================================================================
-const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2, penAnt0: 0, penAntL: 0, penAntMax: 0, penRead0: 0.08, penReadL: 0.015, penReadMax: 0.3, penReady: 0, penSpd0: 0.7, penSpdL: 0.008, penSpdMax: 0.8, penErr0: 3.2, penErrL: 0.04, penErrMin: 2.6, penShotCap: 3.2 };   // calibração por comprimento do túnel
+const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2, penAnt0: 0.12, penAntL: 0.012, penAntMax: 0.35, penRead0: 0.25, penReadL: 0.02, penReadMax: 0.55, penReady: 0, penSpd0: 0.9, penSpdL: 0.01, penSpdMax: 1.05, penErr0: 1.8, penErrL: 0.03, penErrMin: 1.3, penShotMin: 2.8, penShotCap: 3.9 };   // calibração por comprimento do túnel
 // depois do nível 22 (onde tudo atinge o máximo) a dificuldade continua a subir devagar, sem limite
 const OVR = L => Math.max(0, L - 22);
 const AI = {
@@ -1220,6 +1260,7 @@ function aiPlan(fresh, isServe) {
   op.py = by + (pC.y - pL.y) * k + op.ey;
 }
 function aiUpdate(dt) {
+  if (TARGET) { tgMove(dt); return; }            // tiro ao alvo: o alvo move-se sozinho
   const L = G.level;
   // túnel longo dá-lhe mais tempo → um pouco mais lento (e o contrário nos curtos): dificuldade parecida em todos
   const tdk = Math.pow(TD_BASE / TD, TUN.aiExp);
@@ -1385,6 +1426,7 @@ function update(dt) {
       if (ball.y > 0.55) {
         G.toss = null; ball.x = 0; ball.y = 0;
         if (PENALTY) penResult('me', false);                    // penálti: deixar cair a bola é falhar
+        else if (TARGET) tgResult(0);                           // alvo: deixar cair a bola é um tiro falhado
         else {
           G.faults = (G.faults || 0) + 1;                        // bola falhada no serviço = falha
           if (G.faults >= 2) { G.nextServer = 'op'; toServe(); } // 2.ª falha seguida: serve o adversário
@@ -1431,6 +1473,7 @@ function update(dt) {
           if (hp) playerHit(hp);
           else if (ball.z < -Math.max(0.06, -ball.vz * 0.06)) missMe();
         }
+        else if (ball.vz > 0 && ball.z >= TD && TARGET) tgResult(tgScore());   // tiro ao alvo
         else if (ball.vz > 0 && ball.z >= TD) {
           if (hitTest(op)) { oppHit(); if (PENALTY) penResult('me', false); }   // penálti: defendido
           else {
@@ -1451,6 +1494,7 @@ function update(dt) {
         ball.vz = 0; ball.vx *= 0.9; ball.vy = ball.vy * 0.9 + 0.6 * dt; ball.cx = ball.cy = 0;
         ball.z = TD + 0.2 + Math.max(0, netBulge(ball.x, ball.y)) * 0.9;
       }
+      if (TARGET && TG.stuck) { ball.x = op.x + TG.stuck.dx; ball.y = op.y + TG.stuck.dy; ball.z = TD - BR * 0.4; ball.vx = ball.vy = ball.vz = 0; }
       if (ball.z < -0.45 || ball.z > TD + (PENALTY ? 1.3 : 0.6)) ball.visible = false;
       G.timer -= dt;
       if (G.timer <= 0) {
@@ -1465,11 +1509,14 @@ function update(dt) {
           buildVerb(TD_TARGET);
           ballHueTarget = newBallHue(ballHueTarget);
           themePending = newTheme(themeIdx);
-          squashPending = G.level >= 3 && Math.random() < 0.2;
-          // penáltis e túnel com rede: a mesma frequência (≈ 28% cada um, quando não é squash)
-          const rm = Math.random();
-          penPending = !squashPending && rm < 0.28;
-          netPending = !squashPending && rm >= 0.28 && rm < 0.56 ? { top: TY - rnd(0.36, 0.5) } : null;
+          // modos especiais, todos com a mesma frequência (12,5% cada); os restantes 25% são ténis normal
+          const mi = FORCE_IDX !== undefined ? FORCE_IDX : Math.floor(Math.random() / 0.125);   // 0 squash · 1 penáltis · 2 rede · 3 discoteca · 4 cronometrado · 5 alvo · ≥6 normal
+          squashPending = mi === 0 && (G.level >= 3 || FORCE_IDX === 0);      // squash só a partir do nível 3 (antes disso, nível normal)
+          penPending = mi === 1;
+          netPending = mi === 2 ? { top: TY - rnd(0.36, 0.5) } : null;
+          discoPending = mi === 3;
+          timedPending = mi === 4;
+          targetPending = mi === 5;
           visPending = newVis();
           G.warp = { t: 0, dur: 2.3, A: 14 };      // viagem pelo túnel: as paredes correm em direção a ti
           sfx.whoosh(1.3, 0, 0, 0.5, 0, 1.3, 0.9);
@@ -1492,8 +1539,18 @@ function update(dt) {
             PEN.turn = PEN.me.length > PEN.op.length ? 'op' : 'me';
             G.nextServer = PEN.turn; toServe();
           }
+        } else if (G.after === 'tgt') {
+          const tot = TG.shots.reduce((a2, v) => a2 + v, 0), left = TG_N - TG.shots.length, need = tgNeed();
+          if (tot >= need) {                       // pontuação atingida: passa de nível
+            addScore(1000 * G.level); G.after = 'level'; G.mode = 'miss'; G.timer = 0.01; TG.stuck = null;
+          } else if (tot + 10 * left < need || left <= 0) {   // já não dá: perdes uma bola e repetes
+            G.lives--; G.levelLosses = (G.levelLosses || 0) + 1;
+            G.after = (G.lives <= 0 || G.levelLosses >= 3) ? 'gameover' : 'regame';
+            G.mode = 'miss'; G.timer = 0.01; TG.stuck = null;
+          } else toServe();
         } else if (G.after === 'regame') {
           if (PENALTY) penReset();
+          if (TARGET) tgReset();
           G.pm = 0; G.po = 0;                       // novo jogo no mesmo nível
           banner('NÍVEL ' + G.level, '', 1.4, '#ffb0a0');
           toServe();
@@ -1507,6 +1564,7 @@ function update(dt) {
 
   updateFire(dt);
   updateGlitch(dt);
+  updateTimed(dt);
   if (NET && NET.rip) { NET.rip.t += dt; if (NET.rip.t > 2.8) NET.rip = null; }
   if (ballHue !== ballHueTarget) {        // transição gradual da cor (pelo caminho mais curto no círculo)
     let dh = ((ballHueTarget - ballHue + 540) % 360) - 180;
@@ -1519,7 +1577,7 @@ function update(dt) {
     const u = Math.min(1, G.warp.t / G.warp.dur);
     G.warpPhase = G.warp.A * (1 - Math.cos(Math.PI * u)) / 2;
     G.warpGlow = Math.sin(Math.PI * u);
-    if (u >= 0.5 && themePending !== null) { themeIdx = themePending; themePending = null; NET = netPending; netPending = undefined; SQUASH = squashPending; PENALTY = penPending; if (PENALTY) penReset(); }
+    if (u >= 0.5 && themePending !== null) { themeIdx = themePending; themePending = null; NET = netPending; netPending = undefined; SQUASH = squashPending; PENALTY = penPending; if (PENALTY) penReset(); DISCO = discoPending; TIMED = timedPending; TM.kind = ''; TARGET = targetPending; tgReset(); }
     if (u >= 0.5 && visPending !== null) { visIdx = visPending; visPending = null; glitch.timer = rnd(15, 30); }   // troca de cenário no auge do clarão
     if (u >= 1) { G.warp = null; G.warpPhase = 0; G.warpGlow = 0; }
   }
@@ -1558,6 +1616,69 @@ let themeIdx = 0, themePending = null;
 let NET = null, netPending;
 // modo squash (ocasional): os dois jogam do mesmo lado contra a parede do fundo, à vez
 let SQUASH = false, squashPending = false;
+// modo discoteca (só no modo normal): bola de espelhos, pontos de luz, feixes, luz intermitente e batida de fundo
+let DISCO = false, discoPending = false;
+// modo cronometrado (só no modo normal): 3 s para servires e ~10 s para ganhares o ponto (senão perdes o ponto).
+// No serviço do adversário, o relógio do ponto só começa quando devolves. Encurta ligeiramente com o nível.
+let TIMED = false, timedPending = false;
+// modo tiro ao alvo (só no modo normal): a raquete do adversário é um alvo em movimento.
+// Série de 10 remates (cada um é um serviço); anéis valem 10/8/6/4/2; precisas de uma pontuação mínima.
+let TARGET = false, targetPending = false;
+const TG = { shots: [], wp: null, wt: 0, vx: 0, vy: 0, stuck: null, shake: 0 };
+const TG_N = 10;
+// equilíbrio com o comprimento do túnel: num túnel longo o alvo vê-se mais pequeno, a bola demora mais
+// (o efeito desvia-a mais e o alvo anda mais entretanto) → alvo maior, mais lento e menos efeito na bola
+const tgTD = () => TD_TARGET / TD_BASE;
+const tgR = () => clamp(0.4 * Math.pow(tgTD(), 0.5), 0.32, 0.55);
+const tgCurveK = () => 0.6 * Math.min(1, Math.pow(1 / tgTD(), 0.5));   // efeito da bola atenuado no tiro ao alvo
+const TGX = () => TX - tgR() - 0.02, TGY = () => TY - tgR() - 0.02;   // o alvo fica sempre todo dentro do túnel
+const tgNeed = () => Math.round(Math.min(15 + 1.5 * (G.level - 2), 45));   // 15 pontos no nível 2, +1,5 por nível, até 45 (o túnel já é compensado no alvo)
+function tgReset() { TG.shots = []; TG.stuck = null; TG.shake = 0; }
+function tgMove(dt) {                // alvo a deslizar entre pontos ao acaso; mais rápido com o nível
+  const L = G.level, v = Math.min(0.12 + 0.035 * (L - 2), 0.95) * (1 + 0.03 * OVR(L)) * Math.min(1.15, Math.pow(1 / tgTD(), 0.6));
+  TG.wt -= dt;
+  if (!TG.wp || TG.wt <= 0 || Math.hypot(TG.wp.x - op.x, TG.wp.y - op.y) < 0.03) {
+    TG.wp = { x: rnd(-TGX(), TGX()), y: rnd(-TGY(), TGY()) }; TG.wt = rnd(1.2, 3);
+  }
+  const dx = TG.wp.x - op.x, dy = TG.wp.y - op.y, d = Math.hypot(dx, dy) || 1, sp = Math.min(v, d * 2.5);
+  TG.vx += (dx / d * sp - TG.vx) * Math.min(1, dt * 3); TG.vy += (dy / d * sp - TG.vy) * Math.min(1, dt * 3);
+  op.x = clamp(op.x + TG.vx * dt, -TGX(), TGX()); op.y = clamp(op.y + TG.vy * dt, -TGY(), TGY()); op.vx = TG.vx; op.vy = TG.vy;
+  TG.shake = Math.max(0, TG.shake - dt * 2.5);
+}
+function tgResult(pts) {
+  TG.shots.push(pts);
+  if (pts > 0) {
+    TG.stuck = { dx: ball.x - op.x, dy: ball.y - op.y };       // a bola fica cravada no alvo
+    ball.vx = ball.vy = ball.vz = 0; ball.cx = ball.cy = 0; ball.z = TD - BR * 0.4;
+    TG.shake = 1; addScore(pts * 50 * G.level); sfx.target(pts);
+    addFlash(ball.x, ball.y, TD, pts === 10 ? '255,215,80' : '255,255,255', pts === 10 ? 2.5 : 1.4, 0.3);
+  } else { sfx.lose(); ball.vz = -Math.abs(ball.vz) * 0.35; }   // falhou: a bola ressalta na parede do fundo
+  G.mode = 'miss'; G.timer = 1.2; G.after = 'tgt';
+}
+// pontuação: 10 no centro (dourado) até 2 no anel de fora; 0 fora do alvo
+function tgScore() {
+  const d = Math.hypot(ball.x - op.x, ball.y - op.y);
+  const R = tgR();
+  if (d > R + BR * 0.4) return 0;
+  return 10 - 2 * Math.min(4, Math.floor(d / (R / 5)));
+}
+const TM = { kind: '', t: 0, total: 0, tick: 0 };
+const tmServeTime = () => Math.max(2.2, 3 - 0.03 * (G.level - 1));
+const tmPointTime = () => Math.max(6, 10 - 0.15 * (G.level - 1)) * Math.pow(TD / TD_BASE, 0.4);   // túneis longos: mais tempo
+function tmStart(kind) { TM.kind = kind; TM.total = TM.t = kind === 'serve' ? tmServeTime() : tmPointTime(); TM.tick = Math.ceil(TM.t); }
+function updateTimed(dt) {
+  if (!TIMED) { TM.kind = ''; return; }
+  if (G.warp || Math.abs(TD - TD_TARGET) > 0.01) return;               // parado na viagem entre níveis
+  if (G.mode === 'serve' && G.server !== 'op') { if (TM.kind !== 'serve') tmStart('serve'); }
+  else if (!(G.mode === 'play' && TM.kind === 'point')) { if (G.mode !== 'play') TM.kind = ''; return; }
+  TM.t -= dt;
+  const sec = Math.ceil(TM.t);
+  if (sec < TM.tick) { TM.tick = sec; if (sec >= 1 && sec <= 3) sfx.tick(sec === 1); }   // tique-taque nos últimos 3 s
+  if (TM.t <= 0) {                                                       // tempo esgotado: perdes o ponto
+    TM.kind = ''; G.toss = null; fire.k = 0;
+    sfx.timeUp(); missMe();
+  }
+}
 // modo grandes penalidades (ocasional): série de 5 serviços alternados (tu primeiro); o objetivo é fazer ás.
 // Empate no fim → morte súbita, até um falhar. Baliza com rede na parede do fundo.
 let PENALTY = false, penPending = false;
@@ -2163,7 +2284,7 @@ function glitchDark() {
 }
 function updateGlitch(dt) {
   if (!glitch.on) {
-    if ((G.mode !== 'play' && G.mode !== 'serve') || visIdx !== 0) return;   // só em túneis com má visibilidade
+    if ((G.mode !== 'play' && G.mode !== 'serve') || visIdx !== 0 || DISCO) return;   // só em túneis com má visibilidade (nunca na discoteca)
     glitch.timer -= dt;
     // só quando é justo: bola a afastar-se de ti (ainda longe do adversário) ou durante o serviço
     if (glitch.timer <= 0 && !G.warp) startGlitch();          // pode acontecer a qualquer momento
@@ -2385,6 +2506,23 @@ function drawSquashLines() {
   ctx.restore();
 }
 
+// alvo (modo tiro ao alvo): anéis como no tiro com arco, com brilho; abana quando é atingido
+function drawTarget() {
+  const sh = TG.shake, jx = sh ? Math.sin(performance.now() * 0.06) * 0.012 * sh : 0, jy = sh ? Math.cos(performance.now() * 0.075) * 0.008 * sh : 0;
+  const c = P(op.x + jx, op.y + jy, TD), R = tgR() * c.s * K;
+  const cols = ['#f2f2f2', '#1c1c22', '#2f86f0', '#e8433c', '#ffd23f'];   // de fora para dentro
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,220,120,0.6)'; ctx.shadowBlur = R * 0.35;
+  for (let i = 0; i < 5; i++) {
+    ctx.beginPath(); ctx.arc(c.x, c.y, R * (1 - i / 5), 0, Math.PI * 2);
+    ctx.fillStyle = cols[i]; ctx.fill();
+    if (i === 0) ctx.shadowBlur = 0;
+    ctx.strokeStyle = i === 1 ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.35)'; ctx.lineWidth = Math.max(1, R * 0.02); ctx.stroke();
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.beginPath(); ctx.arc(c.x, c.y, Math.max(1, R * 0.025), 0, Math.PI * 2); ctx.fill();   // mosca
+  ctx.restore();
+}
+
 // baliza (modo grandes penalidades): postes, trave e rede a ocupar toda a parede do fundo
 function drawGoal() {
   if (!PENALTY) return;
@@ -2484,7 +2622,7 @@ function drawBall() {
   ctx.globalAlpha = (G.mode === 'boom' ? 1 : ball.z > TD ? clamp(1 - (ball.z - TD) / (PENALTY ? 1.4 : 0.6), 0, 1) : 1) * fogAt(Math.min(ball.z, TD));
   const h = Math.round(ballHue);
   ctx.shadowColor = `hsla(${h},100%,65%,0.8)`;
-  ctx.shadowBlur = r * 0.9;
+  ctx.shadowBlur = r * (DISCO ? 1.8 : 0.9);      // discoteca: brilho mais forte para se ver bem no escuro
   const g = ctx.createRadialGradient(p.x - r * 0.35, p.y - r * 0.4, r * 0.08, p.x, p.y, r);
   g.addColorStop(0, `hsl(${h},40%,${Math.round(98 - depth * 22)}%)`);
   g.addColorStop(0.35, `hsl(${h},100%,${Math.round(82 - depth * 16)}%)`);
@@ -2547,7 +2685,20 @@ function drawHUD() {
   drawLives(G.lives, Math.max(5, G.lives), W * 0.04 + r, top + fs * 1.35, 1, '70,150,255');
   // resultado do jogo (nível): os teus pontos a azul, os do adversário a vermelho
   const sy = top + fs * 1.4, gs = fs * 1.15;
-  if (PENALTY) {
+  if (TARGET) {
+    // tiro ao alvo: pontuação / mínimo necessário e os 10 tiros (cor do anel atingido, ✕ falhado, ○ por fazer)
+    const tot = TG.shots.reduce((a2, v) => a2 + v, 0), need = tgNeed();
+    txt(tot + ' / ' + need, W / 2, sy - fs * 0.15, gs * 0.95, tot >= need ? '#b6ff7a' : '#ffe08a', 'center', 8);
+    const rr = Math.max(3, W * 0.0065), sp = rr * 2.7, x0 = W / 2 - (TG_N - 1) * sp / 2, yy = sy + gs * 0.62;
+    const rc = { 10: '#ffd23f', 8: '#e8433c', 6: '#2f86f0', 4: '#55555f', 2: '#f2f2f2' };
+    for (let i = 0; i < TG_N; i++) {
+      const x = x0 + i * sp, v = TG.shots[i];
+      ctx.beginPath(); ctx.arc(x, yy, rr, 0, Math.PI * 2);
+      if (v > 0) { ctx.fillStyle = rc[v]; ctx.fill(); }
+      else if (v === undefined) { ctx.strokeStyle = 'rgba(255,224,138,0.6)'; ctx.lineWidth = 1.2; ctx.stroke(); }
+      else { ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x - rr, yy - rr); ctx.lineTo(x + rr, yy + rr); ctx.moveTo(x + rr, yy - rr); ctx.lineTo(x - rr, yy + rr); ctx.stroke(); }
+    }
+  } else if (PENALTY) {
     // grandes penalidades: uma linha por jogador — ● golo, ✕ falhado, ○ por marcar
     const rr = Math.max(3.5, W * 0.0085), sp = rr * 2.8;
     const row = (arr, y, rgb) => {
@@ -2569,6 +2720,14 @@ function drawHUD() {
     txt(String(G.pm || 0), W / 2 - gs * 0.9, sy, gs, '#8fc4ff', 'center', 8);
     txt('–', W / 2, sy, gs * 0.8, 'rgba(220,235,245,0.7)', 'center');
     txt(String(G.po || 0), W / 2 + gs * 0.9, sy, gs, '#ff9a8a', 'center', 8);
+  }
+  if (TIMED && TM.kind) {             // cronometrado: barra a esvaziar (amarela e depois vermelha a piscar no fim)
+    const bw = Math.max(90, W * 0.16), bh = Math.max(4, fs * 0.28), bx = W / 2 - bw / 2, by = sy + gs * 0.75;
+    const fr = clamp(TM.t / TM.total, 0, 1), low = TM.t <= 3;
+    const blink = low && (TM.t % 0.5) < 0.25;
+    ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = low ? (blink ? '#ff7060' : '#ff3b2f') : fr < 0.5 ? '#ffd24a' : (TM.kind === 'serve' ? '#9fe8ff' : '#e8f4ff');
+    ctx.fillRect(bx + (bw - bw * fr) / 2, by, bw * fr, bh);
   }
   // progresso para a próxima bola extra
   const ac = (G.aces || 0) % 3;
@@ -2623,6 +2782,194 @@ function drawOverlays() {
   }
 }
 
+// --- Modo discoteca ----------------------------------------------------------
+// 120 BPM, 16 passos por compasso. A luz segue a batida: 2 compassos acesos a pulsar,
+// 1 compasso às escuras (só pontos de luz e feixes) e 1 compasso a acender/apagar a cada tempo.
+const DSC = { t: 0, step: -1, bus: null, bass: null };
+const DSC_STEP = 60 / 140 / 4, DSC_LAT = 0.05;      // 140 batidas por minuto (psytrance)
+const DSC_DIRS = (() => {            // direções dos pontos de luz refletidos pela bola de espelhos
+  const a = [], hues = [0, 45, 120, 185, 210, 285, 320];
+  for (let i = 0; i < 64; i++) {
+    const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2, r = Math.sqrt(1 - u * u);
+    a.push({ x: r * Math.cos(th), y: Math.abs(u) * 0.9 + 0.1 * u, z: r * Math.sin(th), h: hues[i % hues.length] });
+  }
+  return a;
+})();
+// música: psytrance (140 BPM, Fá frígio/menor harmónico, como a referência) — bombo seco,
+// baixo "rolante" em Fá grave nas três semicolcheias entre os bombos, riff ácido em semicolcheias
+// com filtro ressonante (a abrir ao longo de 4 compassos) e eco, pratos no contratempo e um "zap" ocasional
+const MIDI = m => 440 * Math.pow(2, (m - 69) / 12);
+const DSC_RIFF = [
+  [65, 77, 72, 75, 65, 80, 77, 72, 66, 77, 75, 72, 65, 84, 80, 77],   // Fá Fá Dó Ré# Fá Sol# Fá Dó Fá# Fá Ré# Dó Fá Dó Sol# Fá
+  [65, 72, 77, 76, 65, 75, 72, 66, 65, 77, 84, 80, 87, 84, 80, 76]    // ... com o Mi (sensível) a puxar de volta para Fá
+];
+function acid(dst, t, f, dur, vol, cut, q) {   // nota "ácida": serra com filtro ressonante que fecha depressa
+  const o = AC.createOscillator(); o.type = 'sawtooth'; o.frequency.setValueAtTime(f, t);
+  const fl = AC.createBiquadFilter(); fl.type = 'lowpass'; fl.Q.value = q;
+  fl.frequency.setValueAtTime(Math.min(cut * 3, 16000), t); fl.frequency.exponentialRampToValueAtTime(Math.max(cut * 0.5, 120), t + dur);
+  const g = AC.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(fl); fl.connect(g); g.connect(dst); o.start(t); o.stop(t + dur + 0.02);
+}
+function discoAudio(i, when) {
+  if (!audioOn()) return;
+  try {
+    if (!DSC.bus) {
+      DSC.bus = AC.createGain(); DSC.bus.gain.value = 0.32;
+      // saída: seco + reverberação espacial longa (quase nada durante o nível; toda ao sair dele)
+      DSC.dry = AC.createGain(); DSC.dry.gain.value = 1; DSC.bus.connect(DSC.dry); DSC.dry.connect(MASTER);
+      DSC.send = AC.createGain(); DSC.send.gain.value = 0.06; DSC.bus.connect(DSC.send);
+      // reverberação de sala grande (tipo pavilhão/clube vazio): cauda de ~4,5 s, natural, só a abafar um pouco no fim
+      const sr = AC.sampleRate, len = Math.floor(sr * 5), ir = AC.createBuffer(2, len, sr), RT = 4.5;
+      for (let c = 0; c < 2; c++) {
+        const d = ir.getChannelData(c); let y = 0;
+        for (let k = 0; k < len; k++) {
+          const tt = k / sr, cf = 0.85 - 0.45 * Math.min(1, tt / RT);         // agudos amortecem com o tempo
+          y += cf * ((Math.random() * 2 - 1) - y);
+          d[k] = tt < 0.022 ? 0 : y * Math.exp(-6.9 * tt / RT);
+        }
+      }
+      const cv = AC.createConvolver(); cv.buffer = ir;
+      const hp = AC.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 240;   // sem graves na reverberação (não embala o bombo)
+      DSC.wet = AC.createGain(); DSC.wet.gain.value = 1;
+      DSC.send.connect(hp); hp.connect(cv); cv.connect(DSC.wet); DSC.wet.connect(MASTER);
+      DSC.lead = AC.createGain(); DSC.lead.gain.value = 1; DSC.lead.connect(DSC.bus);
+      DSC.dly = AC.createDelay(1); DSC.dly.delayTime.value = DSC_STEP * 3;      // eco em colcheia com ponto
+      // o eco sai à parte (direto + reverberação): ao sair do nível continua a repetir o riff enquanto desaparece
+      DSC.fb = AC.createGain(); DSC.fb.gain.value = 0.42; DSC.echo = AC.createGain(); DSC.echo.gain.value = 0.35 * 0.32;
+      DSC.lead.connect(DSC.dly); DSC.dly.connect(DSC.fb); DSC.fb.connect(DSC.dly); DSC.dly.connect(DSC.echo);
+      DSC.echo.connect(MASTER); DSC.echo.connect(DSC.send);
+    }
+    const b = DSC.bus, st = i % 16, bar = Math.floor(i / 16) % 4;
+    if (st % 4 === 0) {                                                                // bombo seco e curto (deixa espaço ao baixo)
+      tone(b, when, 'sine', 165, 44, 0.22, 1.0);
+      noise(b, when, 'highpass', 3500, 0.7, 0.01, 0.28);
+    } else {                                                                           // baixo rolante: Fá grave, 3 notas por tempo
+      const f = (bar === 3 && st >= 13) ? MIDI(41) * 2 : MIDI(41);                     // no fim do ciclo salta uma oitava
+      acid(b, when, f, DSC_STEP * 0.9, 0.42, 520, 3);
+      tone(b, when, 'sine', f, f, DSC_STEP * 0.8, 0.28, 0.004);                       // sub-grave
+    }
+    if (st % 4 === 2) noise(b, when, 'highpass', 7000, 0.6, 0.1, 0.2);               // prato aberto no contratempo
+    else noise(b, when, 'highpass', 10500, 0.7, 0.022, st % 2 ? 0.07 : 0.04);         // pratos fechados em semicolcheias
+    if (st === 4 || st === 12) noise(b, when, 'bandpass', 1600, 0.8, 0.12, 0.16);      // estalo (leve)
+    // riff ácido: o filtro abre ao longo de 4 compassos; notas acentuadas mais brilhantes
+    const n = DSC_RIFF[bar % 2][st], acc = st % 4 === 3 || n >= 80;
+    const cut = 600 + 2600 * Math.pow((bar * 16 + st) / 64, 1.4);
+    acid(DSC.lead, when, MIDI(n), DSC_STEP * (acc ? 0.95 : 0.7), acc ? 0.085 : 0.06, acc ? cut * 1.6 : cut, 14);
+    if (bar === 0 && st === 0) tone(b, when, 'sine', 2600, 90, 0.35, 0.12, 0.003);     // "zap" no início do ciclo
+    if (bar === 3 && st >= 8) noise(b, when, 'bandpass', 800 + (st - 8) * 900, 2, DSC_STEP, 0.05 + (st - 8) * 0.012);   // subida antes de recomeçar
+  } catch (e) {}
+}
+const DSC_FADE = 3.2;                 // segundos que a música continua a tocar depois de sair do nível
+function updateDisco(dt) {
+  const live = G.mode !== 'title' && G.mode !== 'gameover';
+  // a sair do nível: a música continua a tocar, cada vez mais "lá longe" (mais reverberação, menos som direto) até desaparecer
+  const fading = DSC.leaving && DSC.leaveT < DSC_FADE;
+  if (!live || (!DISCO && !fading)) { DSC.t = 0; DSC.step = -1; return; }
+  if (AC && DSC.bus) {
+    const now = AC.currentTime, g = (n, v) => { n.gain.cancelScheduledValues(now); n.gain.setValueAtTime(v, now); };
+    if (DISCO && DSC.leaving && (!G.warp || DSC.leaveT > 3)) {   // volta a haver discoteca: som normal
+      DSC.leaving = false; g(DSC.dry, 1); g(DSC.send, 0.06); g(DSC.bus, 0.32); g(DSC.fb, 0.42); g(DSC.echo, 0.35 * 0.32);
+    }
+    if (DISCO && G.warp && !discoPending && !DSC.leaving) {
+      DSC.leaving = true; DSC.leaveT = 0;
+      // a música continua ~3 s, cada vez mais "molhada" de reverberação; depois param as notas e fica
+      // a própria música a ressoar: a cauda da reverberação e o eco do riff, a desaparecer até ao nível seguinte
+      g(DSC.dry, DSC.dry.gain.value); DSC.dry.gain.linearRampToValueAtTime(0.0001, now + DSC_FADE);
+      g(DSC.send, DSC.send.gain.value); DSC.send.gain.linearRampToValueAtTime(0.85, now + 1.4);
+      g(DSC.fb, DSC.fb.gain.value); DSC.fb.gain.linearRampToValueAtTime(0.62, now + 1);
+      g(DSC.echo, DSC.echo.gain.value); DSC.echo.gain.linearRampToValueAtTime(0.2, now + 1.5);
+      DSC.echo.gain.setValueAtTime(0.2, now + DSC_FADE); DSC.echo.gain.linearRampToValueAtTime(0.0001, now + DSC_FADE + 6);
+    }
+  }
+  if (DSC.leaving) DSC.leaveT += dt;
+  DSC.t += dt;
+  const n = Math.floor(DSC.t / DSC_STEP);
+  while (DSC.step < n) {              // agenda cada passo com a mesma latência (sem saltos de tempo)
+    DSC.step++;
+    const late = DSC.t - DSC.step * DSC_STEP;
+    if (AC && late < 0.1) discoAudio(DSC.step, AC.currentTime + DSC_LAT - late);
+  }
+}
+// escuridão do túnel (0 = aceso, ~0.75 = escuro) e intensidade do flash do tempo
+function discoLight() {
+  const BT = DSC_STEP * 4, t = Math.max(0, DSC.t - DSC_LAT), beat = Math.floor(t / BT), ph = (t % BT) / BT, bar = Math.floor(beat / 4) % 4;
+  let dk, fl = 0;
+  if (bar <= 1) { dk = 0.08 + 0.8 * Math.pow(ph, 0.6); fl = ph < 0.3 ? 1 - ph / 0.3 : 0; }   // aceso no bombo, cai logo para o escuro
+  else if (bar === 2) dk = 0.93;                                                  // às escuras (só luzes da bola)
+  else { dk = beat % 2 ? 0.93 : 0.06; fl = !(beat % 2) && ph < 0.3 ? 1 - ph / 0.3 : 0; }   // acende/apaga a cada tempo
+  return { dk, fl, t, beat };
+}
+function discoHit(d, M) {            // ponto onde o raio da bola de espelhos bate nas paredes
+  let tm = Infinity, wall = true;
+  const c = (v, a, b) => { if (v > 0 && v < tm) tm = v; };
+  if (d.x > 1e-4) c((TX - M.x) / d.x); else if (d.x < -1e-4) c((-TX - M.x) / d.x);
+  if (d.y > 1e-4) c((TY - M.y) / d.y); else if (d.y < -1e-4) c((-TY - M.y) / d.y);
+  if (d.z > 1e-4) c((TD - M.z) / d.z);
+  else if (d.z < -1e-4) { const tz = (0 - M.z) / d.z; if (tz < tm) wall = false; }
+  if (!wall || tm === Infinity) return null;
+  return { x: M.x + d.x * tm, y: M.y + d.y * tm, z: M.z + d.z * tm };
+}
+function drawDisco() {
+  if (!DISCO) return;
+  const L = discoLight(), rot = L.t * 0.9, cr = Math.cos(rot), sr = Math.sin(rot);
+  // escuridão intermitente sobre o túnel (a bola e as raquetes desenham-se por cima e veem-se sempre)
+  ctx.fillStyle = `rgba(0,0,0,${L.dk})`; ctx.fillRect(-20, -20, W + 40, H + 40);
+  const M = { x: 0, y: -TY + 0.17, z: TD * 0.5 };
+  const pts = [];
+  for (const d0 of DSC_DIRS) {
+    const d = { x: d0.x * cr - d0.z * sr, y: d0.y, z: d0.x * sr + d0.z * cr };
+    const h = discoHit(d, M); if (h) pts.push({ ...h, h: d0.h });
+  }
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  // feixes: alguns raios visíveis da bola até à parede (mais fortes às escuras)
+  const pm = P(M.x, M.y, M.z), bi = 0.2 + 0.45 * L.dk, bstep = L.dk > 0.6 ? 5 : 9;
+  for (let i = 0; i < pts.length; i += bstep) {
+    const q = pts[i], pe = P(q.x, q.y, q.z), w = Math.max(2, 0.07 * pe.s * K);
+    const dx = pe.x - pm.x, dy = pe.y - pm.y, dl = Math.hypot(dx, dy) || 1, nx = -dy / dl * w, ny = dx / dl * w;
+    const g = ctx.createLinearGradient(pm.x, pm.y, pe.x, pe.y);
+    g.addColorStop(0, `hsla(${q.h},100%,70%,${bi})`); g.addColorStop(1, `hsla(${q.h},100%,60%,0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(pm.x, pm.y); ctx.lineTo(pe.x + nx, pe.y + ny); ctx.lineTo(pe.x - nx, pe.y - ny); ctx.closePath(); ctx.fill();
+  }
+  // pontos de luz a deslizar pelas paredes, chão e teto
+  const sa = 0.5 + 0.5 * L.dk;
+  for (const q of pts) {
+    const pe = P(q.x, q.y, q.z), r = Math.max(1.5, (0.04 + 0.02 * L.dk) * pe.s * K), a = sa * fogAt(q.z);
+    const g = ctx.createRadialGradient(pe.x, pe.y, 0, pe.x, pe.y, r);
+    g.addColorStop(0, `hsla(${q.h},100%,85%,${a})`); g.addColorStop(1, `hsla(${q.h},100%,60%,0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(pe.x, pe.y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  // flash colorido no tempo forte (moderado)
+  // banho de cor que muda a cada compasso (mais forte às escuras) + flash colorido no bombo
+  const hue = (Math.floor(L.beat / 4) * 97) % 360;
+  ctx.fillStyle = `hsla(${hue},100%,45%,${0.05 + 0.1 * L.dk})`; ctx.fillRect(-20, -20, W + 40, H + 40);
+  if (L.fl > 0) { ctx.fillStyle = `hsla(${(L.beat * 67) % 360},100%,62%,${0.22 * L.fl})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+  ctx.restore();
+  // bola de espelhos: fio do teto, esfera e facetas a cintilar enquanto roda
+  const R = 0.12 * pm.s * K, top = P(0, -TY, M.z);
+  ctx.save();
+  ctx.globalAlpha = fogAt(M.z);
+  ctx.strokeStyle = 'rgba(200,210,220,0.7)'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(top.x, top.y); ctx.lineTo(pm.x, pm.y - R); ctx.stroke();
+  const gb = ctx.createRadialGradient(pm.x - R * 0.3, pm.y - R * 0.3, R * 0.1, pm.x, pm.y, R);
+  gb.addColorStop(0, '#d8dde4'); gb.addColorStop(0.6, '#7a828c'); gb.addColorStop(1, '#2a2e34');
+  ctx.fillStyle = gb; ctx.beginPath(); ctx.arc(pm.x, pm.y, R, 0, Math.PI * 2); ctx.fill();
+  for (let k = -5; k <= 5; k++) {
+    const lat = k * Math.PI / 12, cl = Math.cos(lat), n = Math.max(4, Math.round(22 * cl));
+    for (let j = 0; j < n; j++) {
+      const lon = j * 2 * Math.PI / n + rot, zf = cl * Math.cos(lon);
+      if (zf < 0.08) continue;
+      const fx = pm.x + cl * Math.sin(lon) * R, fy = pm.y + Math.sin(lat) * R, sz = Math.max(1, R * 0.12 * (0.4 + 0.6 * zf));
+      const hsh = Math.sin(k * 12.9898 + j * 78.233) * 43758.5453 % 1;
+      const sp = Math.pow(Math.max(0, Math.sin(rot * 4 + hsh * 30)), 12);
+      ctx.fillStyle = sp > 0.3 ? `rgba(255,255,255,${0.6 + 0.4 * sp})` : `rgba(${160 + 60 * zf | 0},${170 + 60 * zf | 0},${185 + 60 * zf | 0},0.85)`;
+      ctx.fillRect(fx - sz / 2, fy - sz / 2, sz, sz);
+      if (sp > 0.85) { ctx.fillStyle = `rgba(255,255,255,${(sp - 0.85) * 4})`; ctx.fillRect(fx - sz * 1.5, fy - 0.5, sz * 3, 1); ctx.fillRect(fx - 0.5, fy - sz * 1.5, 1, sz * 3); }
+    }
+  }
+  ctx.restore();
+}
+
 function draw() {
   ctx.save();
   if (G.shake > 0) ctx.translate(rnd(-1, 1) * G.shake * 14, rnd(-1, 1) * G.shake * 10);   // tremor do remate
@@ -2640,12 +2987,14 @@ function draw() {
   drawTunnel();
   const gd = glitchDark();
   if (gd > 0) { ctx.fillStyle = `rgba(0,0,0,${gd})`; ctx.fillRect(-20, -20, W + 40, H + 40); }   // luzes do túnel a falhar
+  drawDisco();
   const behind = ball.z > TD;
   if (behind) drawBall();
   drawSquashLines();
   drawGoal();
   ctx.globalAlpha = fogAt(TD) * 1.15 > 1 ? 1 : fogAt(TD) * 1.15;    // névoa: o adversário quase some ao fundo
-  if (!SQUASH) drawRacketRig(rigOp, op.x, op.y, TD - rigOp.z, PAL.op, TD);
+  if (TARGET) drawTarget();
+  else if (!SQUASH) drawRacketRig(rigOp, op.x, op.y, TD - rigOp.z, PAL.op, TD);
   const sqOp = () => { ctx.save(); ctx.globalAlpha = 0.55; drawRacketRig(rigOp, op.x, op.y, SQZ - rigOp.z * 0.3, PAL.op); ctx.restore(); };
   if (SQUASH && ball.z <= SQZ) sqOp();
   ctx.globalAlpha = 1;
@@ -2681,14 +3030,14 @@ function frame(now) {
   let dt = (now - last) / 1000; last = now;
   if (dt > 0.05) dt = 0.05;
   if (dt < 0) dt = 0;
-  if (!G.paused) { updateMatrix(dt); G.rdt = dt; update(dt * MX.scale); }
+  if (!G.paused) { updateMatrix(dt); G.rdt = dt; update(dt * MX.scale); updateDisco(dt); }
   updateFlightSound();
   draw();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
-window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
+window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setDisco: v => { DISCO = v; }, DSC, setTimed: v => { TIMED = v; }, TM, setTarget: v => { TARGET = v; tgReset(); }, TG, tgCurveK, tgR, tgNeed, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
 })();
 </script>
 </body>

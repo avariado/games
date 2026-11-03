@@ -642,13 +642,25 @@ const sfx = {
       src.start(t); lfo.start(t); src.stop(t + dur + 0.4); lfo.stop(t + dur + 0.4);
     } catch (e) {}
   },
-  goal() {   // golo: bola a entrar na rede + sinos
+  goal() {   // golo: a bola estica a rede (sopro + rede a sacudir) e depois os sinos
     if (!audioOn()) return;
     try {
-      const t = AC.currentTime + 0.001;
-      noise(out(ball.x / TX, 0.6), t, 'lowpass', 900, 0.7, 0.25, 0.4, 300);
+      const t = AC.currentTime + 0.001, pn = ball.x / TX, d = out(pn, 0.45);
+      noise(d, t, 'bandpass', 2600, 0.6, 0.45, 0.55, 1200);             // "chuac" da bola na rede
+      noise(d, t, 'lowpass', 260, 0.7, 0.18, 0.5, 120);                  // baque surdo
+      for (let i = 0; i < 6; i++)                                        // rede a sacudir: pequenos roçares a desvanecer
+        noise(d, t + 0.09 + i * 0.075 + Math.random() * 0.03, 'bandpass', rnd(2200, 4200), 1.2, 0.09, 0.32 * Math.pow(0.72, i));
       const dst = out(0, 0);
-      [659.25, 830.6, 987.8].forEach((f, i) => bell(dst, t + 0.08 + i * 0.09, f, 0.6, 0.18));
+      [659.25, 830.6, 987.8].forEach((f, i) => bell(dst, t + 0.32 + i * 0.09, f, 0.6, 0.16));
+    } catch (e) {}
+  },
+  woodwork() {   // bola no poste/trave: "clang" metálico com ressonância
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001, d = out(ball.x / TX, 0.35);
+      noise(d, t, 'bandpass', 1800, 0.9, 0.05, 0.7);
+      [[587, 1.1, 0.34], [1497, 0.7, 0.2], [2561, 0.45, 0.13], [3912, 0.25, 0.08], [5220, 0.15, 0.05]]
+        .forEach(([f, du, v]) => tone(d, t, 'sine', f, f * 0.995, du, v, 0.002));
     } catch (e) {}
   },
   over() {
@@ -740,7 +752,7 @@ function newGame() {
   themeIdx = 0; themePending = null; visIdx = 1; visPending = null; NET = null;
   buildVerb(TD_BASE);
   shotMemory.length = 0; op.fam = 0;
-  G.score = 0; G.level = 1; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
+  G.score = 0; G.level = 1; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.aceRun = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
   SQUASH = false; squashPending = false; PENALTY = false; penPending = false; penReset();
   G.pops.length = 0; G.served = 0;
   op.x = op.y = 0;
@@ -749,7 +761,7 @@ function newGame() {
 }
 function toServe(keepFaults) {
   G.boom = null; G.boomUsed = false; G.boomBonus = false;
-  G.toss = null;
+  G.toss = null; PEN.rip = null; PEN.netBall = false;
   if (!keepFaults) G.faults = 0;
   MX.arm = null; MX.used = false;
   if (MX.on) { MX.on = false; MX.scale = 1; if (MLP && AC) MLP.frequency.setTargetAtTime(20000, AC.currentTime, 0.05); }
@@ -901,6 +913,7 @@ function wallAim(tfs) {
   else       { const sy2 = w === 2 ? -1 : 1; ball.vy = clamp((2 * LY * sy2 - ay - ball.y) / tfs, -2.2, 2.2); ball.vx = clamp((ax - ball.x) / tfs, -1.3, 1.3); }
 }
 function oppHit(weak, isServe) {
+  if (!isServe && G.rally === 0 && G.server !== 'op') G.aceRun = 0;   // devolveu o teu serviço: acaba a série de ases
   G.turn = 'me';
   ball.z = 2 * TD - ball.z;
   const L = G.level;
@@ -976,6 +989,7 @@ function oppHit(weak, isServe) {
 function serveFault() {
   if (PENALTY) { penResult(G.server, false); return; }   // penálti falhado (sem segunda oportunidade)
   G.faults = (G.faults || 0) + 1;
+  if (G.server !== 'op') G.aceRun = 0;
   G.mode = 'miss'; G.timer = 0.9; G.after = 'fault';
 }
 // --- Bumerangue (raro e inesperado): numa bola que o adversário falha, a bola segue até ao "infinito",
@@ -1069,6 +1083,7 @@ function missOpp() {
   let extra = false;
   if (ace) {
     G.aces = (G.aces || 0) + 1;
+    G.aceRun = (G.aceRun || 0) + 1;     // ases seguidos: o adversário fica cada vez mais atento
     const k = G.aces % 3 === 0 ? 3 : G.aces % 3;
     if (k === 3 && G.lives < MAX_LIVES) { G.lives++; extra = true; pop('3 ASES · +1 BOLA', '#7fd4ff'); sfx.extra(); }
     else pop('SERVIÇO DIRETO ' + k + '/3', '#7fd4ff');
@@ -1127,7 +1142,7 @@ function hitTest(p) {
 //    puxá-lo para um lado e jogar rápido para o outro é a forma de lhe ganhar pontos.
 //  · Erra mais com bolas rápidas, com efeito e em jogadas longas (cansaço).
 // =========================================================================
-const TUN = { speedExp: 0.75, aiExp: 0.4 };   // calibração por comprimento do túnel
+const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2 };   // calibração por comprimento do túnel
 const AI = {
   skill: L => Math.min(0.8, 0.14 + 0.05 * (L - 1)),      // leitura do jogo (0..1) — cresce até ~nível 15
   vmax:  L => Math.min(0.68 + 0.085 * (L - 1), 1.95),     // velocidade máxima
@@ -1180,6 +1195,8 @@ function aiPlan(fresh, isServe) {
     op.react = AI.react(L) * Math.sqrt(TD / TD_BASE) * (SQUASH ? 1.4 : 1);   // túnel curto: reage mais depressa
     // serviço: quanto mais alto o nível, mais vezes "lê" o serviço logo à partida (arranca já para o lado certo)
     op.read = isServe && Math.random() < Math.min(0.15 + 0.09 * (L - 1), 0.9);
+    // adivinha o teu serviço: cada vez mais vezes com o nível e, sobretudo, depois de ases seguidos
+    op.antic = isServe && G.server !== 'op' && Math.random() < Math.min(Math.min(TUN.antL0 + TUN.antL * (L - 1), TUN.antMax) + TUN.aceRun * Math.min(G.aceRun || 0, 3), 0.93);
     if (isServe) {   // à espera do serviço: mais atento — cada vez mais com o nível (ases um pouco mais difíceis)
       const ready = Math.min(1, (L - 1) / 10);
       op.react *= 0.6 - 0.25 * ready; op.ex *= 0.7 - 0.3 * ready; op.ey *= 0.7 - 0.3 * ready;
@@ -1199,8 +1216,12 @@ function aiUpdate(dt) {
   // túnel longo dá-lhe mais tempo → um pouco mais lento (e o contrário nos curtos): dificuldade parecida em todos
   const tdk = Math.pow(TD_BASE / TD, TUN.aiExp);
   let vm = AI.vmax(L) * tdk * Math.max(0.8, 1 - 0.012 * Math.min(G.rally, 15));
-  const am = AI.amax(L) * tdk * (SQUASH ? 0.8 : 1);
+  let am = AI.amax(L) * tdk * (SQUASH ? 0.8 : 1);
   if (SQUASH) vm *= 0.8;
+  // a receber o teu serviço: se adivinhou o serviço (op.antic), arranca muito mais depressa para lá
+  if (G.mode === 'play' && G.rally === 0 && G.server !== 'op' && aiIncoming()) {
+    if (op.antic) { vm *= 1 + TUN.antBoost; am *= 1 + TUN.antBoost; }
+  }
   let tx, ty;
   if (G.mode === 'play' && aiIncoming()) {
     op.react = Math.max(0, (op.react || 0) - dt);
@@ -1373,6 +1394,7 @@ function update(dt) {
       if (G.mode === 'play' && netHitTest(zPrev)) {
         // bola na rede: trava e cai; perde o ponto quem bateu
         const mineShot = ball.vz > 0;
+        NET.rip = { x: ball.x, y: Math.max(ball.y, NET.top), t: 0, d: Math.sign(ball.vz) };   // a rede abana onde a bola bateu
         ball.z = TD / 2 - Math.sign(ball.vz) * 0.02; ball.vz = -Math.sign(ball.vz) * 0.25;
         ball.vx *= 0.2; ball.vy = 0.5; ball.cx = ball.cy = 0; fire.k = 0;
         sfx.net();
@@ -1406,6 +1428,7 @@ function update(dt) {
             // quase fora do alcance: às vezes estica-se e devolve uma bola fraca e central (oportunidade para atacares)
             const ddx = (ball.x - op.x) / (PW + 0.17), ddy = (ball.y - op.y) / (PH + 0.14);
             if (ddx * ddx + ddy * ddy <= 1 && Math.random() < Math.min(0.12 + 0.03 * G.level, 0.45)) { oppHit(true); if (PENALTY) penResult('me', false); }
+            else if (PENALTY && penWoodwork()) {}
             else if (!tryBoomerang()) missOpp();
           }
         }
@@ -1413,7 +1436,12 @@ function update(dt) {
       }
     }
     if (G.mode === 'miss') {
-      if (PENALTY && PEN.netBall && ball.z > TD + 0.16) { ball.z = TD + 0.16; ball.vz = 0; ball.vx *= 0.3; ball.vy *= 0.3; ball.cx = ball.cy = 0; }   // bola presa na rede da baliza
+      if (PENALTY && PEN.netBall && ball.z > TD + 0.2) {          // bola na rede: estica-a e fica presa
+        if (!PEN.rip) { PEN.rip = { x: clamp(ball.x, -GX, GX), y: clamp(ball.y, -GY, TY), t: 0 }; sfx.goal(); }
+        PEN.rip.t += dt;
+        ball.vz = 0; ball.vx *= 0.9; ball.vy = ball.vy * 0.9 + 0.6 * dt; ball.cx = ball.cy = 0;
+        ball.z = TD + 0.2 + Math.max(0, netBulge(ball.x, ball.y));
+      }
       if (ball.z < -0.45 || ball.z > TD + 0.6) ball.visible = false;
       G.timer -= dt;
       if (G.timer <= 0) {
@@ -1429,9 +1457,10 @@ function update(dt) {
           ballHueTarget = newBallHue(ballHueTarget);
           themePending = newTheme(themeIdx);
           squashPending = G.level >= 3 && Math.random() < 0.2;
-          penPending = !squashPending && G.level >= 2 && Math.random() < 0.15;
-          if (penPending) squashPending = false;
-          netPending = !squashPending && !penPending && Math.random() < 0.3 ? { top: TY - rnd(0.36, 0.5) } : null;
+          // penáltis e túnel com rede: a mesma frequência (≈ 28% cada um, quando não é squash)
+          const rm = Math.random();
+          penPending = !squashPending && rm < 0.28;
+          netPending = !squashPending && rm >= 0.28 && rm < 0.56 ? { top: TY - rnd(0.36, 0.5) } : null;
           visPending = newVis();
           G.warp = { t: 0, dur: 2.3, A: 14 };      // viagem pelo túnel: as paredes correm em direção a ti
           sfx.whoosh(1.3, 0, 0, 0.5, 0, 1.3, 0.9);
@@ -1469,6 +1498,7 @@ function update(dt) {
 
   updateFire(dt);
   updateGlitch(dt);
+  if (NET && NET.rip) { NET.rip.t += dt; if (NET.rip.t > 1.6) NET.rip = null; }
   if (ballHue !== ballHueTarget) {        // transição gradual da cor (pelo caminho mais curto no círculo)
     let dh = ((ballHueTarget - ballHue + 540) % 360) - 180;
     ballHue = (ballHue + dh * (1 - Math.exp(-dt * 2.2)) + 360) % 360;
@@ -1523,13 +1553,41 @@ let SQUASH = false, squashPending = false;
 // Empate no fim → morte súbita, até um falhar. Baliza com rede na parede do fundo.
 let PENALTY = false, penPending = false;
 const PEN = { me: [], op: [], turn: 'me' };
-function penReset() { PEN.me = []; PEN.op = []; PEN.turn = 'me'; PEN.netBall = false; }
+const GX = TX - 0.03, GY = TY - 0.03, GPR = 0.02;    // postes (x = ±GX), trave (y = -GY), meia espessura
+// ondulação da rede depois do golo (empurrada para trás no ponto onde a bola entrou)
+function netBulge(x, y) {
+  const r = PEN.rip; if (!r) return 0;
+  const g = Math.exp(-((x - r.x) ** 2 + (y - r.y) ** 2) / 0.14);
+  return 0.24 * g * (1 - Math.exp(-r.t * 22)) * Math.exp(-2.2 * r.t) * Math.cos(8 * r.t);
+}
+// bola nos ferros: decide se entra ou sai (como no futebol). Devolve true se tocou.
+function penWoodwork() {
+  const ax = Math.abs(ball.x), post = ax > GX - GPR - BR * 0.7, bar = ball.y < -(GY - GPR - BR * 0.7);
+  if (!post && !bar) return false;
+  sfx.woodwork(); G.shake = 0.15; addFlash(ball.x, ball.y, TD, '255,255,255', 1.4, 0.25);
+  ball.cx = ball.cy = 0;
+  const inside = post ? ax < GX : ball.y > -GY;               // lado de dentro do ferro: mais provável entrar
+  const goes = Math.random() < (inside ? 0.62 : 0.28);
+  if (goes) {                                                  // ferro e golo
+    ball.vz = Math.abs(ball.vz) * 0.55;
+    if (post) ball.vx = -Math.sign(ball.x) * (Math.abs(ball.vx) * 0.4 + 0.5);
+    if (bar) ball.vy = Math.abs(ball.vy) * 0.4 + 0.9;
+    ball.z = TD + 0.01; penResult('me', true);
+  } else {                                                     // ferro e fora: a bola ressalta para trás
+    ball.vz = -Math.abs(ball.vz) * 0.4;
+    if (post) ball.vx = -Math.sign(ball.x) * (Math.abs(ball.vx) * 0.3 + 0.35);
+    if (bar) ball.vy = Math.abs(ball.vy) * 0.3 + 0.6;
+    ball.z = TD - 0.01; penResult('me', false);
+  }
+  return true;
+}
+function penReset() { PEN.me = []; PEN.op = []; PEN.turn = 'me'; PEN.netBall = false; PEN.rip = null; }
 function penResult(side, scored) {
   if (G.mode === 'miss' && G.after === 'pen') return;          // já registado
   PEN[side].push(scored);
   PEN.netBall = scored && side === 'me';                       // o teu golo fica preso na rede
   if (scored && side === 'me') addScore(500 * G.level);
-  if (scored) sfx.goal(); else if (side === 'op') sfx.win(); else sfx.lose();
+  if (scored && side === 'op') sfx.lose(); else if (!scored) (side === 'op' ? sfx.win() : sfx.lose());   // o teu golo soa ao entrar na rede
   G.mode = 'miss'; G.timer = 1.5; G.after = 'pen';
 }
 // decide a série: devolve 'me', 'op' ou null (continua)
@@ -2319,47 +2377,69 @@ function drawSquashLines() {
 // baliza (modo grandes penalidades): postes, trave e rede a ocupar toda a parede do fundo
 function drawGoal() {
   if (!PENALTY) return;
-  const zr = TD + 0.28;                     // fundo da rede (ligeiramente atrás da parede)
-  const f = rectAt(TD), b = rectAt(zr);
+  const zr = TD + 0.3;                      // fundo da rede (atrás da parede)
   ctx.save();
-  // rede: malha em losango no fundo + redes laterais e de cima
-  ctx.strokeStyle = 'rgba(235,240,245,0.28)'; ctx.lineWidth = 1;
+  // rede do fundo: malha em losango (ondula com o golo)
+  ctx.strokeStyle = 'rgba(235,240,245,0.3)'; ctx.lineWidth = 1;
   ctx.beginPath();
-  const st = (b.w) / 28;
-  for (let x = -b.h; x <= b.w; x += st) {
-    ctx.moveTo(b.x + x, b.y); ctx.lineTo(b.x + x + b.h, b.y + b.h);
-    ctx.moveTo(b.x + x + b.h, b.y); ctx.lineTo(b.x + x, b.y + b.h);
+  const st = 2 * GX / 28, n = PEN.rip ? 12 : 1;
+  for (const sg of [1, -1]) {               // famílias x − y = c e x + y = c
+    for (let c = -(GX + TY) - st; c <= GX + TY + st; c += st) {
+      // segmento da reta dentro do retângulo [-GX, GX] × [-GY, TY]
+      let x0, x1;
+      if (sg === 1) { x0 = Math.max(-GX, c - GY); x1 = Math.min(GX, c + TY); }
+      else { x0 = Math.max(-GX, c - TY); x1 = Math.min(GX, c + GY); }
+      if (x1 <= x0) continue;
+      for (let i = 0; i <= n; i++) {
+        const x = x0 + (x1 - x0) * i / n, y = sg === 1 ? x - c : c - x;
+        const q = P(x, y, zr + netBulge(x, y));
+        if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
+      }
+    }
   }
-  ctx.save(); ctx.beginPath(); ctx.rect(b.x, b.y, b.w, b.h); ctx.clip();
-  ctx.beginPath();
-  for (let x = -b.h; x <= b.w; x += st) {
-    ctx.moveTo(b.x + x, b.y); ctx.lineTo(b.x + x + b.h, b.y + b.h);
-    ctx.moveTo(b.x + x + b.h, b.y); ctx.lineTo(b.x + x, b.y + b.h);
-  }
-  ctx.stroke(); ctx.restore();
+  ctx.stroke();
+  // redes laterais e de cima: linhas de profundidade do aro até ao fundo
   ctx.strokeStyle = 'rgba(235,240,245,0.22)';
   ctx.beginPath();
-  for (let k = 0; k <= 6; k++) {          // linhas de profundidade das redes laterais e de cima
-    const u = k / 6;
-    let p1 = P(-TX, -TY + u * 2 * TY, TD), p2 = P(-TX, -TY + u * 2 * TY, zr); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
-    p1 = P(TX, -TY + u * 2 * TY, TD); p2 = P(TX, -TY + u * 2 * TY, zr); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
-    p1 = P(-TX + u * 2 * TX, -TY, TD); p2 = P(-TX + u * 2 * TX, -TY, zr); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+  for (let k = 0; k <= 6; k++) {
+    const u = k / 6, yy = -GY + u * (TY + GY), xx = -GX + u * 2 * GX;
+    for (const [x1, y1] of [[-GX, yy], [GX, yy], [xx, -GY]]) {
+      const p1 = P(x1, y1, TD), p2 = P(x1, y1, zr + netBulge(x1, y1) * 0.4);
+      ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+    }
+  }
+  for (const [x1, y1, x2, y2] of [[-GX, -GY, GX, -GY], [-GX, -GY, -GX, TY], [GX, -GY, GX, TY]]) {   // aro de trás
+    const p1 = P(x1, y1, zr), p2 = P(x2, y2, zr); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
   }
   ctx.stroke();
   // postes e trave (brancos, com brilho)
+  const a1 = P(-GX, TY, TD), a2 = P(-GX, -GY, TD), a3 = P(GX, -GY, TD), a4 = P(GX, TY, TD);
   ctx.shadowColor = 'rgba(255,255,255,0.8)'; ctx.shadowBlur = 8;
-  ctx.strokeStyle = 'rgba(250,252,255,0.95)'; ctx.lineWidth = Math.max(3, 0.04 * P(0, 0, TD).s * K);
-  ctx.beginPath();
-  ctx.moveTo(f.x, f.y + f.h); ctx.lineTo(f.x, f.y); ctx.lineTo(f.x + f.w, f.y); ctx.lineTo(f.x + f.w, f.y + f.h);
+  ctx.strokeStyle = 'rgba(250,252,255,0.95)'; ctx.lineWidth = Math.max(3, 2 * GPR * P(0, 0, TD).s * K);
+  ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(a1.x, a1.y); ctx.lineTo(a2.x, a2.y); ctx.lineTo(a3.x, a3.y); ctx.lineTo(a4.x, a4.y);
   ctx.stroke();
   ctx.restore();
 }
 
 // rede: malha translúcida com fita branca no topo e postes nos lados
+// rede do meio a abanar depois de a bola lá bater (empurrada no sentido da bola, amortece)
+function netWave(x, y) {
+  const r = NET && NET.rip; if (!r) return 0;
+  const g = Math.exp(-((x - r.x) ** 2 + (y - r.y) ** 2) / 0.09);
+  return r.d * 0.075 * g * (1 - Math.exp(-r.t * 30)) * Math.exp(-3 * r.t) * Math.cos(12 * r.t);
+}
 function drawNet() {
   if (!NET) return;
   const zm = TD / 2, top = NET.top;
   const a = P(-TX, top, zm), b = P(TX, TY, zm);
+  const wv = !!NET.rip, NX = wv ? 24 : 1, NY = wv ? 8 : 1;
+  const line = (x0, y0, x1, y1, n) => {
+    for (let i = 0; i <= n; i++) {
+      const x = x0 + (x1 - x0) * i / n, y = y0 + (y1 - y0) * i / n, q = P(x, y, zm + netWave(x, y));
+      if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
+    }
+  };
   ctx.save();
   ctx.globalAlpha = fogAt(zm);
   ctx.fillStyle = 'rgba(20,30,40,0.25)';
@@ -2367,12 +2447,12 @@ function drawNet() {
   ctx.strokeStyle = 'rgba(220,235,245,0.28)'; ctx.lineWidth = 1;
   ctx.beginPath();
   const step = 0.05;
-  for (let x = -TX; x <= TX + 1e-6; x += step) { const p1 = P(x, top, zm), p2 = P(x, TY, zm); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); }
-  for (let y = top; y <= TY + 1e-6; y += step) { const p1 = P(-TX, y, zm), p2 = P(TX, y, zm); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); }
+  for (let x = -TX; x <= TX + 1e-6; x += step) line(x, top, x, TY, NY);
+  for (let y = top; y <= TY + 1e-6; y += step) line(-TX, y, TX, y, NX);
   ctx.stroke();
   // fita do topo
   ctx.strokeStyle = 'rgba(250,252,255,0.95)'; ctx.lineWidth = Math.max(2, 0.025 * P(0, 0, zm).s * K);
-  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, a.y); ctx.stroke();
+  ctx.beginPath(); line(-TX, top, TX, top, NX); ctx.stroke();
   // postes
   ctx.strokeStyle = 'rgba(180,190,200,0.9)'; ctx.lineWidth = Math.max(2, 0.03 * P(0, 0, zm).s * K);
   ctx.beginPath(); ctx.moveTo(a.x, a.y - 2); ctx.lineTo(a.x, b.y); ctx.moveTo(b.x, a.y - 2); ctx.lineTo(b.x, b.y); ctx.stroke();

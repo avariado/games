@@ -1,0 +1,2455 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>VIBEBALL</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  body{display:flex;align-items:center;justify-content:center}
+  #wrap{position:relative;width:min(100vw,calc(100vh * 4 / 3));aspect-ratio:4/3;background:#000}
+  body.touch{align-items:flex-start}
+  body.touch #wrap{width:100vw;height:100vh;aspect-ratio:auto}   /* tela no ecrã todo: espaço por baixo para a pega e o dedo */
+  canvas{display:block;width:100%;height:100%;cursor:none;touch-action:none;user-select:none;-webkit-user-select:none}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+(() => {
+'use strict';
+
+/* =========================================================================
+   VIBEBALL — jogo em HTML5 (inspirado no Curveball)
+   Mundo 3D: túnel com x ∈ [-TX,TX], y ∈ [-TY,TY], z ∈ [0,TD]
+   z = 0 → plano do jogador (frente) | z = TD → plano do adversário (fundo)
+   ========================================================================= */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+// --- Geometria -----------------------------------------------------------
+const TX = 1.0, TY = 0.75;               // meia-largura, meia-altura
+const TD_BASE = 2.2;
+let TD = TD_BASE, TD_TARGET = TD_BASE;    // profundidade do túnel (muda aleatoriamente a cada nível)
+// comprimento sorteado entre 1,2 e 4,6 (o normal é 2,2), sempre bem diferente do anterior
+function tunnelInfo(d) {
+  if (d < 1.45) return { name: 'TÚNEL MÍNIMO', sub: 'Reflexos puros' };
+  if (d < 1.8)  return { name: 'TÚNEL MUITO CURTO', sub: 'A bola chega num instante' };
+  if (d < 2.05) return { name: 'TÚNEL CURTO', sub: 'Menos tempo para reagir' };
+  if (d < 2.45) return { name: 'TÚNEL NORMAL', sub: '' };
+  if (d < 2.95) return { name: 'TÚNEL LONGO', sub: 'As curvas ficam mais abertas' };
+  if (d < 3.6)  return { name: 'TÚNEL MUITO LONGO', sub: 'Curvas enormes' };
+  return { name: 'TÚNEL GIGANTE', sub: 'O adversário quase desaparece' };
+}
+// cor da bola: muda a cada nível (sem vermelhos/laranjas, reservados ao adversário e ao fogo)
+const BALL_HUES = [100, 185, 45, 270, 315, 60, 160, 220];
+let ballHue = 100, ballHueTarget = 100;
+function newBallHue(prev) {
+  const opts = BALL_HUES.filter(h => Math.abs(h - prev) > 25);
+  return opts[Math.floor(Math.random() * opts.length)];
+}
+function newTunnel(prev) {
+  let d;
+  do { d = Math.round((1.2 + Math.random() * 3.4) * 20) / 20; } while (Math.abs(d - prev) < 0.45);
+  return d;
+}
+const CAM = 1.05;                        // distância da câmara ao plano frontal
+const PW = 0.21, PH = 0.18;              // semi-eixos da cabeça oval das raquetes
+const BR = 0.065;                        // raio da bola
+const LX = TX - BR, LY = TY - BR;        // limites do centro da bola
+const PX = TX - PW, PY = TY - PH;        // limites do centro das raquetes
+
+// --- Física --------------------------------------------------------------
+const DEFLECT    = 1.15;   // velocidade lateral máxima dada pelo ponto de impacto (borda da raquete)
+const CURVE_K    = 0.55;   // aceleração lateral (efeito Magnus) por unidade de velocidade da raquete
+const CMAX       = 4.2;    // aceleração de curva máxima
+const VMAX       = 2.8;    // velocidade lateral máxima
+const SPIN_DECAY = 0.22;   // perda de rotação no ar (por segundo)
+const SUBSTEP    = 1 / 240;
+const MAX_LIVES  = 15;     // máximo de bolas acumuláveis (ases + níveis concluídos)
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+// --- Ecrã / projeção -----------------------------------------------------
+let W = 800, H = 600, K = 1, CX = 400, CY = 300;
+function resize() {
+  const r = cv.getBoundingClientRect();
+  W = r.width; H = r.height;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (document.body.classList.contains('touch')) {
+    // ecrã tátil: a tela ocupa o ecrã todo; o túnel fica em cima e por baixo sobra espaço
+    // para a pega comprida e para o dedo (que fica exatamente na ponta da pega)
+    const top = H * 0.90;
+    K = Math.min(W / (2 * TX), top / (2 * TY)) * 0.985;
+    CX = W / 2; CY = top / 2;
+  } else {
+    K = Math.min(W / (2 * TX), H / (2 * TY)) * 0.985;
+    CX = W / 2; CY = H / 2;
+  }
+}
+window.addEventListener('resize', resize);
+resize();
+
+// projeção em perspetiva verdadeira
+function P(x, y, z) {
+  const s = CAM / (CAM + z);
+  return { x: CX + x * s * K, y: CY + y * s * K, s };
+}
+
+// --- Estado --------------------------------------------------------------
+const G = {
+  mode: 'title',          // title | serve | play | miss | gameover
+  score: 0, hi: 0, level: 1, lives: 5, opp: 3, rally: 0,
+  timer: 0, after: null, paused: false, muted: false,
+  banner: null, pops: [], served: 0, overAt: 0
+};
+try { G.hi = +localStorage.getItem('vibeball_hi') || +localStorage.getItem('curveball_hi') || 0; } catch (e) {}
+
+const ball = { x: 0, y: 0, z: BR, vx: 0, vy: 0, vz: 0, cx: 0, cy: 0, rot: 0, visible: true };
+const me = { x: 0, y: 0, vx: 0, vy: 0, gx: 0, gy: 0 };   // g = memória curta do gesto (orienta a face)
+const op = { x: 0, y: 0, vx: 0, vy: 0, ex: 0, ey: 0, fx: 0, fy: 0 };
+const input = { x: 0, y: 0, fx: 0, fy: 0, touch: false, down: false };
+const IS_TOUCH = (window.matchMedia && matchMedia('(pointer: coarse)').matches) || ('ontouchstart' in window);
+if (window.matchMedia && matchMedia('(pointer: coarse)').matches) { document.body.classList.add('touch'); resize(); }
+
+// --- Entrada (rato / toque) ---------------------------------------------
+const samples = [];  // histórico de posições da raquete para medir a velocidade do gesto
+function toWorld(ev) {
+  const r = cv.getBoundingClientRect();
+  const sx = (ev.clientX - r.left) * (W / r.width);
+  const sy = (ev.clientY - r.top) * (H / r.height);
+  return { x: (sx - CX) / K, y: (sy - CY) / K };
+}
+// ---- Toque: o dedo segura a raquete pela PEGA, a cabeça fica acima do dedo e à vista ----
+const HANDLE_L_TOUCH = 0.17;          // pega normal
+const GRIP_V = 0.18 + HANDLE_L_TOUCH + 0.012;   // = ponta final da pega      // distância do centro da cabeça ao ponto da pega onde está o dedo
+const TOUCH_GAIN_Y = 1, TOUCH_GAIN_X = 1;   // 1:1 → o dedo fica exatamente na ponta da pega // pequeno ganho vertical para a cabeça alcançar o fundo do túnel
+// vetor (no ecrã) do centro da cabeça até à pega, segundo a orientação atual da raquete
+function gripOffset() {
+  // deslocamento FIXO (dedo diretamente abaixo da raquete): assim a raquete não "salta"
+  // quando roda entre direita e esquerda; a haste desenhada liga a pega ao dedo
+  return { x: 0, y: GRIP_V };
+}
+// posição da cabeça da raquete a partir do ponteiro
+function headFrom(fx, fy) {
+  if (!input.touch) return { x: fx, y: fy };
+  const g = gripOffset();
+  return { x: fx * TOUCH_GAIN_X - g.x, y: fy * TOUCH_GAIN_Y - g.y };
+}
+// ---- Rato: bloqueio do ponteiro (Pointer Lock) ----
+// Com o rato bloqueado o jogo lê apenas o MOVIMENTO: não há cursor a bater nas bordas do ecrã
+// nem "zona morta" ao inverter o sentido junto aos limites. Esc liberta o rato (e pausa).
+// Sem bloqueio (plano B): ganho de 1,15 → a raquete chega aos limites antes de o cursor chegar à borda.
+const LOCK = { on: false, x: 0, y: 0, lostAt: 0, since: 0, ax: 0, ay: 0, pending: false };
+const NO_LOCK = /nolock/.test(location.search);   // ?nolock desativa o bloqueio (testes)
+const MOUSE_GAIN = 1.15, MOUSE_SENS = 1.1;
+function requestLock() {
+  if (NO_LOCK || document.pointerLockElement === cv || !cv.requestPointerLock) return;
+  // ponto de partida: onde a raquete está no momento do clique (alguns navegadores enviam movimentos falsos ao bloquear)
+  LOCK.ax = clamp(input.x, -PX, PX); LOCK.ay = clamp(input.y, -PY, PY); LOCK.pending = true;
+  try { const pr = cv.requestPointerLock(); if (pr && pr.catch) pr.catch(() => { LOCK.pending = false; }); } catch (e) { LOCK.pending = false; }
+}
+document.addEventListener('pointerlockchange', () => {
+  LOCK.on = document.pointerLockElement === cv;
+  if (LOCK.on) { LOCK.x = LOCK.ax; LOCK.y = LOCK.ay; LOCK.since = performance.now(); LOCK.pending = false; pushWorld(LOCK.x, LOCK.y, false); }
+  else if (G.mode === 'play' || G.mode === 'serve' || G.mode === 'miss') { G.paused = true; LOCK.lostAt = performance.now(); }
+});
+function pushWorld(x, y, touch) {
+  input.touch = touch;
+  input.fx = x; input.fy = y;
+  const h = headFrom(x, y);
+  input.x = h.x; input.y = h.y;
+  samples.push({ t: performance.now(), x: clamp(h.x, -PX, PX), y: clamp(h.y, -PY, PY) });
+  if (samples.length > 64) samples.shift();
+}
+function pushSample(ev) {
+  const touch = ev.pointerType === 'touch' || ev.pointerType === 'pen';
+  if (!touch && !LOCK.on && document.pointerLockElement === cv) {   // bloqueio já ativo, aviso ainda a caminho
+    LOCK.on = true; LOCK.x = LOCK.ax; LOCK.y = LOCK.ay; LOCK.since = performance.now(); LOCK.pending = false;
+  }
+  if (!touch && LOCK.pending && !LOCK.on && performance.now() - LOCK.since > 0 && ev.type === 'pointermove' && ev.clientX === 0 && ev.clientY === 0) return;
+  if (LOCK.on && !touch) {
+    // movimento relativo, limitado ao alcance da raquete (sem zona morta)
+    // alguns navegadores enviam um salto falso ao bloquear: ignora o arranque e saltos absurdos
+    const mx = ev.movementX || 0, my = ev.movementY || 0;
+    if (performance.now() - LOCK.since < 80 || Math.abs(mx) > 250 || Math.abs(my) > 250) return;
+    const r = cv.getBoundingClientRect(), sc = (W / r.width) / K * MOUSE_SENS;
+    LOCK.x = clamp(LOCK.x + mx * sc, -PX, PX);
+    LOCK.y = clamp(LOCK.y + my * sc, -PY, PY);
+    pushWorld(LOCK.x, LOCK.y, false);
+    return;
+  }
+  const p = toWorld(ev);
+  if (!touch) { p.x *= MOUSE_GAIN; p.y *= MOUSE_GAIN; }
+  pushWorld(p.x, p.y, touch);
+}
+window.addEventListener('pointermove', e => {
+  if (!e.isPrimary) return;                          // só o primeiro dedo move a raquete
+  if (LOCK.on) { pushSample(e); return; }            // bloqueado: o evento principal já soma o movimento
+  const list = e.getCoalescedEvents ? e.getCoalescedEvents() : null;
+  if (list && list.length) for (const ev of list) pushSample(ev); else pushSample(e);
+});
+window.addEventListener('pointerup', e => { if (e.isPrimary) input.down = false; });
+window.addEventListener('pointercancel', e => { if (e.isPrimary) input.down = false; });
+
+// velocidade da raquete (unidades do mundo por segundo) nos últimos ~50 ms
+function paddleVel() {
+  const now = performance.now();
+  while (samples.length && now - samples[0].t > 140) samples.shift();
+  if (samples.length < 2) return { x: 0, y: 0 };
+  const a = samples[samples.length - 1];
+  if (now - a.t > 60) return { x: 0, y: 0 };          // rato parado
+  let b = samples[0];
+  for (let i = samples.length - 2; i >= 0; i--) {
+    if (a.t - samples[i].t >= 50) { b = samples[i]; break; }
+  }
+  const dt = Math.max((a.t - b.t) / 1000, 0.012);
+  return { x: (a.x - b.x) / dt, y: (a.y - b.y) / dt };
+}
+
+window.addEventListener('pointerdown', e => {
+  if (e.button !== undefined && e.button !== 0) return;
+  e.preventDefault();
+  unlockAudio();
+  const touch = e.pointerType === 'touch' || e.pointerType === 'pen';
+  if (e.isPrimary) {
+    if (touch) samples.length = 0;   // novo toque: a raquete "salta" para o dedo sem contar como golpe
+    pushSample(e);
+    input.down = true;
+  }
+  if (!touch) requestLock();         // clique: o jogo captura o rato
+  if (G.paused) { G.paused = false; return; }
+  if (G.mode === 'title') { newGame(); return; }
+  if (G.mode === 'gameover') { if (performance.now() - G.overAt > 900) newGame(); return; }
+  // no toque, o primeiro dedo só agarra a raquete; um toque com um 2.º dedo serve / remata
+  if (touch && e.isPrimary) return;
+  if (touch) { secondFinger(); return; }
+  if (G.mode === 'serve' && G.server !== 'op') serve();
+  else if (G.mode === 'play') strike();
+});
+window.addEventListener('contextmenu', e => e.preventDefault());
+// 2.º dedo em QUALQUER parte do ecrã: serve / remata. Os eventos de toque servem de reserva,
+// porque alguns Android tratam dois dedos como gesto de zoom e não entregam o pointerdown.
+let lastSecond = 0;
+function secondFinger() {
+  const now = performance.now();
+  if (now - lastSecond < 120) return;   // evita contar o mesmo toque duas vezes
+  lastSecond = now;
+  unlockAudio();
+  if (G.paused) { G.paused = false; return; }
+  if (G.mode === 'serve' && G.server !== 'op') serve();
+  else if (G.mode === 'play') strike();
+}
+document.addEventListener('touchstart', e => {
+  if (e.touches.length >= 2) { e.preventDefault(); secondFinger(); }
+}, { passive: false });
+document.addEventListener('touchmove', e => { e.preventDefault(); }, { passive: false });
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'p' || k === 'escape') {
+    if (k === 'escape' && performance.now() - LOCK.lostAt < 400) return;   // o Esc já libertou o rato e pausou
+    if (G.mode === 'play' || G.mode === 'serve' || G.mode === 'miss') G.paused = !G.paused;
+  } else if (k === 'm') {
+    setMuted(!G.muted);
+  } else if (k === ' ') {
+    e.preventDefault();
+    unlockAudio();
+    if (G.mode === 'serve' && G.server !== 'op' && !G.paused) serve();
+    else if (G.mode === 'play' && !G.paused) strike();
+    else if (G.mode === 'title') newGame();
+  }
+});
+window.addEventListener('blur', () => { if (G.mode === 'play' || G.mode === 'serve') G.paused = true; });
+
+// --- Som (sintetizado em tempo real: impacto, ressonância, atrito, distância e estéreo) ---
+let MLP = null, AC = null, MASTER = null, NOISE = null, PINK = null, FLY = null, VERB = null, lastWall = 0;
+// swoosh gravado (fornecido pelo utilizador), embutido em base64 — mono, 1,05 s
+let SWOOSH = null, SW_PEAK = 0.48, CONV = null;
+// reverberação do túnel: túnel curto = seco e curto; túnel gigante = longo e cavernoso
+function buildVerb(depth) {
+  if (!AC || !CONV) return;
+  try {
+    const T = 0.7 + Math.max(0, depth - 1.2) * 0.65;          // tempo de decaimento (≈0,7 s … 2,9 s)
+    const sr = AC.sampleRate, len = Math.floor(sr * T * 1.15);
+    const ir = AC.createBuffer(2, len, sr);
+    const echo = 0.018 * depth;                                  // reflexões entre as paredes do túnel
+    for (let ch = 0; ch < 2; ch++) {
+      const dd = ir.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        const tt = i / sr;
+        dd[i] = (Math.random() * 2 - 1) * Math.exp(-tt * 6.9 / T) * (tt < 0.015 ? tt / 0.015 : 1) * 0.6;
+      }
+      for (let k = 1; k <= 6; k++) {                              // ecos discretos que se repetem
+        const at = Math.floor((echo * k + (ch ? 0.004 : 0)) * sr);
+        if (at < len) dd[at] += 0.7 * Math.exp(-echo * k * 6.9 / T) * (k % 2 ? 1 : -1);
+      }
+    }
+    CONV.buffer = ir;
+  } catch (e) {}
+}
+// quantidade de eco enviada: cresce com o comprimento do túnel
+const verbScale = () => 0.8 + Math.max(0, TD - 1.2) * 0.5;
+const SWOOSH_B64 = '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W66LZkKf5KbMdAnSWa7fdaItgMrq6Go5CqZHhPZ5Q519BldziqktFlDbNIc0+UPVyLRJ1XhcWVSREpSbdB8hWBo4VNHUeJX7gXHjFPogepcFH2sYwRlqzRIzm0zM//uExO2DFGHVAA4NOYp1Op/FzCA5iD9H0HQGlmDKqqKhCtq6LVFSt7OOOGBCHTAtDo5hggqT0NipUZKNvk460ZoJFSS0huT65Kalc2avi9lZnWreiaH7OrHQLD3qaNKH02psC6PSmykw8ck00X9FQVLQ2LC2s1EOIR3AlFRqq8PCFlOPNNLJFTTYKu5Ixh0ybRRw1BHMoRCbVUmJDk1RGqzSRxXMDBhIqQUEU26UNMcJScjTSM7GGrwYJXUymKtiLvM2lR4Bw5J4ONAKLmkSKM1so+knmqOJbPoCUmqxhWFE+GFBRK1QFBVVSuzMzGFdS+NQoEBCjCgIn1VS8oxMzawCAlUqoVZ0BE9VVJSakzNQwEftRJRqoCM1AaAxyDHhWqrDgoKcFEGMBEwdUioQr+uBv4//Fd2L6ifwVIIIAAA0dP0BNZjlRlSICAFuxECE//uExOqDUr3U+i2NFcqAul4FzCApIcEEAoIR/XA2zuu8sKjcgyqiyBr78Rekr0ElksxXqXbkzQUIWHBdn0X/+7GVEdvqqdFRVT///1RVZ2MVLqp5K82Mlk4TzYrKpwnC6uG/NxpCKhCDweI0DbmkKypVSeZJUsuu5pVZNg0hISx0gJzBoUhYRB8gnCcNz//7GVzhuNISIqNB4jYer2iq9VVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//uExO0AEVV46G0YacqBNxJloqbpVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV';
+// pancada de ténis gravada (fornecida pelo utilizador), embutida — mono, 0,68 s
+let HITBUF = null;
+const HIT_B64 = 'SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjYwLjE2LjEwMAAAAAAAAAAAAAAA//uEwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAeAAAosAAQEBAYGBghISEpKSkpMTExOTk5QkJCQkpKSlJSUlpaWlpjY2Nra2tzc3Nze3t7hISEjIyMjJSUlJycnKWlpaWtra21tbW9vb29xsbGzs7O1tbW1t7e3ufn5+/v7+/39/f///8AAAAATGF2YzYwLjMxAAAAAAAAAAAAAAAAJAVAAAAAAAAAKLBFj9SNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//uExAAAEMWK9hQ0AAqEr2o/MwAC/LrvvohOBgYGYlfoQKA3BuLi4uLi4ueKJUu73/wQKA0DwUFz3+XyAbi596fKIiIiVKJuLi4vZANw/tBQypcUFBQxK0FAXg3D8XFw7BuDcPwaB4KChiVJYeChlOWe8O7vf7igoYn+guLvCECiV8u7u9/8vegue/Ce4oKCgoKCgojsw8PDwAQDOzO7GzIzK8N+93s7oLBJ/8wOAIGIf3VgHSAd7Gkz47Kl7UjgE8P0dUqFSHYDAgDY5im5JjMCgwDwc5NA4mkiaIE4QAnC4OQOwLeFu6c3aSCRIDsEdjTDpyoM2Z2skpe9jNRKDgIYWifKpX6q9jRZuT6CEcDGA5hPjnlcR//7uvfecYQYMuVxKY7yKF8n///ofbQK5ADUnSMHARAmyfKJupWpUmgVKpUmlUmpQCoVAcCNqR8G//uExAmAFBFLhbmZABItHepTnvABd3MANojg7L1X6ZCes97MndsgW8AhBcRFCqeC9gzApMqFQzOXHsLDxWxqbmNE1FKBf8DOwFPFCmKSV7lx1C3CCAe+onCLLVRRdnpOoPgHgWAP3FjSEJDXRWpauvKgy4oMiZfKBOJa//5ZIOUS2ThuQ8iZAy8iyKkvf/ycHMKiZTGXImQ8Zs+YEUYxh0S5JOggAABzFxFeOIT1xYRSC2h/AnhYgPoD6V5IixFyYEC9bjKwk2xscoOkZHVtF9mHyhNX72Rc4XSdVqyoltkYi3H8fri3R6wl00sMqpe70w1risXerQo0J9FrnWL0jfFa1znOcZpjNc51/v4/9rQa+N10V9HuvgNG/K7FinDiGEN+W/Ne4KtT/gR15K1gAAAAGkrdgNnat7jl4AE12F/tnKiQaVfLiq/UZcIvrBiX//uExBEBlAmJRQwYfQJsrqkthhpoVZuT7NMd3kUhmTNngmKRibZbDUen8I7SshazKrzkRiA33nIg7kY1zO3VhqPPhSq4DBZdOFuLGmuq8InCr0SjCIuEbNOI8ABKcjC0efQHEpxmLbax53/4z9+Ilr+xeIw1G1mRa2dKSjzKxrqUbw9N1v3tJz6czlbBmozjGnXaaCCAgEIydIxkyPCwi7mIIgOmqocrmSAmlMtaqb8+8znurE3g4rGXxcZ/h6epjN8RwREPzA9BONxIHo+G5qIpTPy+XB/PQqLKRUkueiWIh8YrnGPSMlfWpgLNC7RChKbIwGBZY8sKuXLSOg4jezKc0/760GQft0565K+6m/R2JMZDkMaY9Njue+/4zGKYCafuY2s2+/2t0jrf3X0KeZbaRz6J7YNYL+0aGJEWNECEcEaTKHoOoXRFMBb7WGbu//uExBCD1CFNSA0w3Ip1qKjBh5ppk3NpEui0qh2JV4aziUbhlwYebhFknXEcBT8w/UPODCmmxaDY1IItL2SN8uVlUXbWHm5IdFbIMzD+OFq6yCoaT2bnf1dVfAhOsIN3YaYzB7qE3q4muxQwRmh1uzV4zfmNc7bm3A2t5Ep6P0pfK5L/7tTDd79lkcG7WlmdNLvj/7yKxkkShkLVakjsx9YVRgWSCVm9QV6KmWUi2l4nWoFUjqJ8bSsQ5xUVGFSG6c6fPsUlPCJjCXThGMFmYU+qEKnc2dPleuJY6IwjoqpRs6GKJVK5fVkVmVMK8Fiduw1ooUt5OLO3HW5JK+AWOQOLcuyU0kmASByJdbKWck+rzWg6K6Jy4XCFkGJsTbd2w5sTieIsEVsYq4X3VZ2meaW/VQgAAAF8lhmvKCM8bszZOlgaxlaCz5nYNCWqyJ33//uExA6BkzlBRwwk2Ipqp+hVlhsSlWq4j9NnVUb1rldssQiz/Q0uiGFbGCxN5nXaU6LIGl1ogJQ+rMsMEYkHWChBA+IQ4BaQIlCcy7i7CInco0KnvJyTgELNCDVOsgdZdriiKf5oUgcWKMLlCzka2ZT9rumvI6T2gzNDvjU5L1qFaraIW2nf+nDuVNBAsiLV/54AOszsqhLApco/pUL6cRaQIQNIw4VB7A31gEClipmkaylr7TkhV1KHMJLhUzzUsDtgbCwhlTbKPN2mrztwE6WIWrajqsD4sBuEQNghMUIUAtGqdVAZNW2Ii4y8oYhiuxoRqaYxNZJJNRFakToA9kkpNX45hwQ6jkmLNpG59QyRTdsNQuDi08JLuWmC5o4l8qn/51Q4QlXIRdRyqpRAAAAA3vbHElZ25MRS0bqxNhpjA14VqqJHuES+ZSDoCwkv//uExBGBjzDVSywwb8IQpykxhIroE02LB6WDEc0bEJ0IQ8DobE30H0/mdzKNEdw6aEAwgJhi4zGXlNWz9akozzV1rzcey1lTp6tvoqwgygnWKIHHEpauxaFrFElmDmyZV9fc1RgkRKI5V9iMAAAHjDEKNiCMzZX/YAHLXKtAGMLTiRV8NAiEfm5I1mXvLHYKdyvGYzqVy5yJPGGhkwnQDoNi7LA80OGAwsVFBGwQAWgDIaEpkPSKH0yIXMIFGEOYwm3cVkVyu15Svzr/E73MhzFuqeulUc1tr6Jy0Spe5yIVEpXdI5EYtNFGmRzL0Z1FwAAAAAABRlj0sSdpNNkCwpbRuzksQUOPIilbJVlrWh1hL6NAlzR8W3MDINiQUHQCgICYBUlmlFSMK6axGhIxsme4+iPE7BKMQJ15tiponNNnPtKdpaTnYF1Ed9yvsZMz//uExDABj6DpSUwkc0HCoyn1hI4h59fUvJXMUG0bnMoSsJIEYvLCzqyg+ksh/XQ56hTpJglTMETfsrbbpF2Wsmbk0lPhEUKQJpqxLkgOWOhLKcVuSKMkpK+KVTkhOTJO5GOn4TgtUTyhxIU4sfRnEgRoZPE3ixWfL5/TjlahHZqZb5n3yK+JUm5+VelxC5mLOg1OcmyJb/kC2pj5Z5zP96/u0qAEAAAAACVM6zaaWSqeGHmbuxGGVTkhxb0WUebZtn3bjKYHFBEDYXESJR6FXChwiVRoZ7cAshJZMTyyBhI7GUsYehRSMl0jyDN2Utl/3RUh7rXh+jwxXYq3zOFIxSwn//bGMiPj5zBKDqSiUKxfxf8pAj8PtyTuvKsNWCAlyFOQ46cq4J9r5dJ+FblbzyEyBIjpmK5UympTedtocbXxQiScun5o3VOqMywSRehB//uExFaBj0UZS6wkcYneGWjphg5o2PpGHM5jhOVjiFQmxefHFscPlDeN6lsgrmWI73maUNhSjGp2GXVxoXATzMVeIWpCW0VcajyISaGQWExdi5hT62kQp2StgAAAAAAAAACnoelsbY22NL6NJou2mgWAh5QXYRebSXsxZDAbxvVL5bEXlDwSPljSAQoCAs2FASwQokBnVXCkPNEJOki7BJQLOoPtI0EnPPTdbRa12K+tUpaUnmqV3U/3c6GMMLYtL3tCtQYm4RUhkwtz2IXUKIDBwwaJ7UnFYAAF1iDJZp42mqLMuYAtVcgQUqIJNABo06/io3qWK3J1bTarlXWvC+Ostt20R4nLClYKC6HR8XlwnGawqHpkZIJ6vI1jpGdngeIY7tLTZUXTxOz1V1t9y8LcGXSP2UvYZwB3TcFc7mt7da/oLPQ3n+DC/5pnu+ZX//uExHsBj8TZR+ykc0H9FKhpl7JB7x+IP//0vmqEAAAAAADIo0x20rGdRVIlpKmD/kk5zTGw0aESD4kmEJlv1cP0Jx4pzlHwOisRNnuZVlKkEcl0NE/UBPU/MtqNdRkHVQGS3ySG7mMjHJfYKaVz+OjG5VXirl8wL+538J0IFRyjEbL7GRPXimOBhpxCzLxcV7mhUgdPAcdv6Okpa0w2AQAqwXB0MsIhAWBS9QEtpTiqJvBmdqfCIRMVjhCyV7sPw6uOaKz+BKKyoO4/uCeZnZgOwMg5hHpMcC1MsPD5eJxiOYtXohDPyUH6Hw5nzPvwkJCbPmnucfafhBjpIVNpoDW+dSDBpySDT9PseiONW7h9FD8uzu3V/6///aT+JTBNCUUzPc0AAAAAKdZ2xVu6PK0XpbZsScyqa7zmQ+4iZfB+UgnSeBhDfw077AWlHhTb//uExJmBkDjRP0y8b8ITmWfplg5pOiYrGlhGlcAEkaDB8G4geXUOLOOSE7RwwHVprqI1w4iERpCgdijz9PjHalOSRImXW0mUDzhhs6fBNwsRKmUPmHsZQQYRgS795KQdb61euEpxc6xE6kLGLUiawQliRepYFVUyUa+LbXXNtvUkTpLAtBwGoZGEDJSUxMuLGVWaJXX54RqfMy/UqPpsq0ocKGNWi9qszynqarWdamSxkz3+3sjJvL6eosWAjRGfu0d5NIedanU9CsAAAAAACcWy/PV0oxs0YwmE/zYRQh/6cbkEC30hOIViop4LOf9U6mD8QC1uTVFyOzdtxp52XsF0/7zu9BEcdBcLB5WhUPrNEAXUEBoNn1CcUIQBygIhdohrIN5jJsoU349VTPjMKOGLiWw6XyndhWkYhQbtFiSZtZEkcaMoWreh1FQClYa5//uExLOBjyynQ0wxMkGcIulphIoqUGISGVpyp3vu7KMpgw5qTZtwBmMIYNS5QSFpVoKolroyuqItNeBEdYFd8uZniSah9D/JArE8f8RyQwmrAbyIel2hQXJPMMVtZFtmOY051lk0EFIAKYCjeyR3TDSZmNy3oZIvZgvOOGU1fUSO9C/hzE8qqQNbgLh71AK7OX/2gBPMP778ku2qAN5UewaCiITC4GKAYBEwwZMHExGGBiKHfoHMyAQHSwkLgEF3VSMpU7IAZYBmxbVdyMKWIcJq/nnxZu9AQHLRYUjmXgcGKKXMO9cVDLZSks4bDl7LKXgKSjVSLdB8pva21MkZTm2/MV8XtiVyejsKuWobyEzwocR7JT1ea7qBsdxTYdPQEaghANJ662eV+5d/MrHQx+hGx+qLOYm1lAdJj/8If7JAAKcnlloTUkgCeAQYOXLW//uExOCBkCTvPUwkeIItleddp5qZBxtAMCkYk3MltBxc2TBFkBCBoGjiHGRCCL/IdU0UjUA6uWoK3Mzc5YNU7gQlxDcYjaOcuxdx0GkglIZozzgS5PVWQhMJpGuafZ26SGikLuyISyq1HQ8Oa8+kdxeDJ+S4xJdlmMzTewlpWvByG1JhzbH1Nb7b4xmv/2L363bV9YsM51hZynq5fZLDF+w1cmUqAACV3P7SAIIDAaTMHAwNBkoBSFICBZgNFAL3BozMcjcIGJggLF8EKQcQiqBU3VYyEEp8IkpfoNRFPZ2G1WW2VR5XyEDmsnSapE8WKioAkDnyx14hG2OL1dZnCyVwrRcB2qkecJh0ejNR/CFIIY+CVQ/XllhpCT2acR19zb65r/Hzk4IjBbhAzlFEFwpn7Z3nufmWZxzMMADMRH2WJdsaLbPkYE0pimGBhUCm//uExPeBlH0jMC28epp9oyapp5rZOEjAUxREObGVGgJAdAUYkmf9iIRyM5iiKoDEjh0KudOpNx0S0yfyxRAJfISCCqHEcK2KAV8RUu45yXgwi1MsmxEuCvC0Iebx5L6TL5hMjfUpM0NUyYgI4dhovnCVK5fIFib7qeoAIYOJJXJwVajKRE9JmVqGekpzMjnD8+5Wl6ZZYxwLzo2WSixLEljCpiqAAAACeWGpgFA5gg6FRYIFB4HZGkSYq6GuCB6JsZVYGwj4iMCCkvwZcYWIgmMwkBItkoLKRfXm/KFgMAnmv+MoHsrHBuy8cFPkgkRKYqrArTEJgaAjoaxkMQ9ZBVkP1MocSo63x5sRpK8esYzIi0OUSHqt/GU8ZUKxLQ3tJI0V6wWlcoEXVI0aubyyRss8GkMVaQNgZaDY5K2sWkKiYsGogewzDoVJ1XsR+8JZ//uExPMB1EkdME4wfEJcIuYVp46g2cVRkYEABITFAEUERYjCFQYMDLFM0hzGYUKjxiQAQABICBRoHWHOOJEMSX6AASUAKAJuoAnwRfaOnyvqPpZQ0wyIKQdKDl0rDRlt3PYkvRfCRE9EkEqmcnjUNRJ+nxprDTk5rlmAY1HobhVLDtaGbuj0QpRltS4LmdrNxun+U7GJoLKPGCRFALOSCTzJGr72e7YBPYvVgAAAAY2zRYZfgwBIfIAmTEQGFQsCggYcAF0NEvzDkISKBZeEIyTE4S9MUXeXqHoBg0JSlwPSjcpWobF4osZMB1G8cpU7krffRocBo5rnhtRxSVBF2kxNu0+/DNFzzD7OK/zyOm9ULl0a+F/Kn/ry2rSVsyzYmEjq8LTDY0xFyxcwIPbdo702wlIGjUpqLX8uF6qNmiCa8mMxtfMO/2MbWz39Sx/2//uExPODlUjbLQ3h7UJemqXFvJn45v5695ZowV2aN/OyQAKXVMpojYWRpnrrXk2FszpA1Zu2Ibu6j1iuBW+yzVmEOKrM/lqAZi6pbrcmDkZCMVsXqDkQG3n4GGj9CVOVMzw7Un163ozowUCooGh00z3eMqmcVTufi6mOdIQbPD4RwhKutf8agqKtUl4hQIkBpw2iiFXG0udmj19KAIsKgNMAgsRhwEhww0LwcJjAwGMLAcw2NTNxaNyEMWqprC2mViYFBSYYAJiMrmTgmSOpRFSCNFDYiAY4GZgKQM6SrQ2CAhhB4YI9BOYdWahMGPwcGMWOLXIDwUaEiSapMRL1FAZrKZ6VzlhwsdCI+IJEOI4OS5VOrWX/a6gBTmeB2FmKLl+WSKfWIueCmhMlofhYbJRIJRAoAcQEMUYpLoCcdKwXbZCicXIdTWgd7Uyklnwh//uExPABlg1bLu3gz8ntH6e1hg5gdXitpXVVK43af3KhUbrJUrtNV88ZJRlXh41UV4Z093YGLQM7zu+zvWkOoMJBLsF/CqWGAhQOKB4cHQggLw7CNFPDeE445jNeCDJUEzcSCwWCBnQYIEm+W1AqyLZmWcQo+oMrNTAcBBEk8+7NC1rXVmocH9eVxog2zSWPxdUd1JBkzxP0oQzmUpisBTCZzCqdncalkgbjF56IT8WqbnatATB1yownmZGtPlddPlbSoXtoC1N1tMVR70LF33RivwJ5GPVwjPf1ndNe3/+tVQHWFCAgtsDh0wItJR4ZBjCAEQlo6ZlqTTZ47uFObvzYigMVwxALso1gBLHglTMKlDBgNKVQBQpuDDFgaOj9IKo/jTwYct63Zz23SvkBalQtTpFBs6Yd5LqAmwQDZUER9RLcZv1DY0p9m0AsHht6//uExPeDm6lZIA5pL8qLmeVFvBn5mdu1P3JTI5VRyKT5hIUSkh6MEB+JJWHYZVOZxSW0xo9dqScCwPPWOQsWA5AybMn8ThYLVMY0UJtDTa+2j/1LgABiQMBwECMYIABCkFDK5jAQhI8BBgs0mVIpiImbjvC5Ix0LCAoWyizQypRcBDhVcGmYMgObuksgwwMvgrMykuOLMWaqdRR+lLVhkclAH7YY7mEAqlrNqBMdyUXQgBMB0LAlh0hF4dg+FBTPHbumHneQWeXNp/a9mDZ+n4/2dlIazS9YOdz5mWZaK8DC76uX1dzVqbVbkbfpgomjjpWHTSn0dcZgsZbu+V7VQAAAEIIUd2+aGmOTFyg0GDAoSGShp050VxolBrUp0J5kXxjRa/woXBpNIEagDJ4cFGGFoEk13OZaXaRyTISHKxopvBoo5IKATsLIYJwCBBgA//uExNSBlaDrKC3hEYKpIuVpvDGx3UIKVqQhbLuHAgS5n+XIuRynej2k5zkSxnnLFQ2M1LEiNXEZgjv7woE/1S/tn2wGci7VoKlFuUP3RtLlTbUz8p0n1V8NVFow08aLJ53qWpaH0VdcB3HRYX23xi4QAQADAYkHISi240UAAzMI3zZjIHYZhiEGDQcIiMiOKDCZShhhGKJli3y3qG6AZYUMM6U8uhTJa7UlrMkQFqBvwqVY0KZZD0JjLM27Oo1lkKgbktu/K6I9DEif4iGJ2NS11N8bx84jlmP7dD8E2e+lfmDfnqZfV0rKKicO8eq9Otbtru9/M+u9n3TMym/cW+90fPVdh/70QAABUve3FrzvNJWFZmzhW0OHF1wpkE4hlyYRuMuZkKgKnAGHtMWGdJ20HWqISkKFftipF3Yuw9rlMPbtH5QwxTaCm9P1jR7V//uExMYBlJUpKM08dUJ9GiVVvDHxDXHwbnBbE/DJkZF0MVjZwjVKlDbzLd3WPuCawyYqklM6VAoCO0KmDB2DcjZXH/ju/P0BXq76uuHwOYGnc9a+v/9wiL87aGD9K2ooRBzS7L6O0bgQXkKSQFVBUYCjK6mkr4Xo/6Ji9lBwSRfZZ6PNNejDlwzDkEM6aG3DrV4FldiWqzkx8rB3CWzc7iH0BrAu1E1yij6KT9ay3msvs5QgGxh0udPI6tVTJMvVbsX+EIH4Pi72NGuQLDyYaERJ7QClAcvXWzoOdFUBmmrKrLlLjrTKwV3y6aBhhpAIYA0yDJVgHPApwQzAYAVIdowAWnysLnoJlV1YXSUXxV4u9hM4h2cBXIqIHeG8gyBLy0mGU0n7wpmQMMXJuUCBHyiGC0i0q2lfTS4bGWLGYbwW2saOBGniYke9KSOIWhFY//uExMGBkSzJLs0weIoXHSXlpg8QLyyBW24KsOh2E3Ggqh4bHICyQXAXCnT+hByKifLRHCLnKjZQu1rq+yoUPbxNkAMMpO4vP+mgoJzcERDHJgxRbZiCdDA2sOywVy3KZq4CtkpZ87dOr1t2gROSVxCPVo9khAkrpDsLTQhoyiwdpNUYOge3LxGgV9S+nUHV+n/0cRex4YUJhLaL6XJrSdpDJmVN1LDeCm71hNzaFYAAAAAdRGDIaxgLC4CDDDwcWGZ9H1yxhfM1WDhB80yGNMLhYbLOIHuknGHFAkDjQEDgV3VxITnXdVmyO72sGLAKuFylEWwx5+HDYo4zwnZ+dGJUEInCcP48hCFwJDsOojD2WTZgeBIOyClW6gWVtJm8BloNm76ndZp9FGqi7//vf6au1J0gp+ycsfOzl4unISpfF6nm/K7EF1//GRa9vlVP//uExNcBkXCfKC3l7QIDFeUVrDGo71pAlZGXAc5niNjEzDAE7k9BgyOyDBFg3UbgmbYyXLA04tMEFzBlgILMCHR6LUhglQ5e6hCpoMXkqZwXvX4qrEWzvtZXBBcRf5gQiIK4B/dQT8kCcYCSVyoRhOPD1iVrHFSM61pvOa9GdX4ZE0rFFWBmruGUwXDZV4QA/Om2l3qYNYsHLwYknybTEmgCVJjldylgAAAAA24xkEgMaQmSmEXnEYp71IllAU4BhU5wwYYmzZBcUWeMABHR7JWqDoZNZJtrah/E5V+MvizP1YmfsvaSVhZWzuxk5MBP2t4LxeHztnbAdJwFBxPkxtU4XHIAQkTOEEj8r/ZMGBLUJiHgqTKK6E1dnCYk20e6C8zW2tnWZ6Mzzv3Yu4+681MrZPWTxru3aPe/Xa9z4ikIzN1tB9ndGAdEh41YYpML//uExO4BlGENJy2w2Io/GiTZpg8QhiA9DsEESozCSIIr1mm0kZ1rSaEYAcwukDmEAZnhGcUPCGQGKzh4xnpgYByXLaASBoep3wK15uZhArCR9fS5X+VamiqeBm4MydGKO5IpWytwoqnk3KRPE6VJYj4CgKAiABj1FxQaHGK2o4bEC58XMU7vFZB6nFsO15SVGDcdUXAlHlpCkk3HP1EPEROn3EPF332k3rtyl19+QXy7Ru8LAOdbrQAqVsQKisRHB4gJueu5LxYoIDDqc/TE6Nc/LozkMxKhJEzB8RFzFhTcBy4wFIvAYcPHkc0EyoI3Daw6nT6LZXKkWkO36i79g4FGmGvlEYbZBK4ZqwCsehh51m2cz2bvs3OZ6NDwC3zS0JtBNGy55AmagUJOV1qCBlm6QSVKreL7tfwTv3L2vciuy3sX/LUf2tvMn+SlGfQv//uExPIBlAFZJ00w2EqvKyPJvKG4tytu8sjeeOYfhUqHhQUEKXK+to1xCLGgrjkgd6lSKIL/VLGWOGedhogyBUCHC1BZ5OQwQh0ZYX5eVsQQJAGSYmkjVYo2RWEyFiQ8SUdYrU88NCOeLHDYCdJJvRj1vA8JExs+uJ+yjaxEIl0BbfN9Z/Ksn8WdeqcNBAkLEw4TQ5wJIGosWkw+88KtSMFW8n7vZb771RAAAygoZg4Uj6VpEOKADQqwkICC/ZkgobDFmmZZgRMaEgmUDhMaMGDikDAICEx0XSZMKAkb0flVl6r2Ygo0kRIEML4RRzX0keBbysNupgH6hacZ2FZVhYjOPlnSCtjymsm3z0wQFgEYYdRlkkp8K6zmzN/m/l8zSXY8u/MxKw0DYWJLCCg6qF7xdRBpcZKHkXAd6KTDyKW+MVs++kvil2zBAMFAsvAp//uExOmDlYFZHk0kfMH9FWRFp6ZYksqDB0FEnsxhbOqkzMts0ZUBB+BhgSOwhZh8AOGixdISUYwKTGhl1VgI2iO3ddqjT5XS3SA1K5gyDicThL3fd34Ka4/T+wC1x3Hcb2OwW7bO2aQS/cFODAdFm1L34pbkpvU2O58HHkQa4kYpyKqO6KhEOiZ9zI7z2Rk7/SePKp6WczTrXVhKlSGKhTP5Dxgen6HrtS5cavHqMDGhgELksFgRWengdTAAEZgYyaermvzR492awUgaUSSCwgqAB5EFm4CIgaQVaCDwMUSAQCoWl4oaxNzWfrGSiTnadJXgRnaHATxOgxmUSNvaJ1oTPwZeh6DIu+7KH9uw8XKQ+QCEIui5RK49ylW5Ph/VVjttPjt2Rac+P/OZp/YMtUEvjS8TamBcL3Y6vtj9bgvY+Edfd7Ohy/9H35/3aIYs//uExPEDk4jbHM281MKPKyLBvBX4Cgl0Weq5X0PAJCBtUKgSaAVmcNhkPsfJTmZFQiyHgR1BRIxSjWsEAxcMaCTQCrC/76H9FFW4pkQ+sUlDN5OnUGEHWizBOw8BdymHwSp0hRQm6fx8pCPOMZSsZvIdRkPg/VbBY6VjacHOTbNH7di2PNUvxPnMRwUGMfvdElPaFHN+5/bmGhjEpzL31LZZQ5YRzvr+3jtb5/3fj/2/JVAAAqy7QqEKATX3KCwERBkhXQQwMWENKzCdJ1qppSwKEGxGLkBwZnZqwIGEKpo9RJbyUVLOsPDgSmi0nuVqj6bjpLReZ+nqZZAQZl1QJxEEujSepLqWTAhFInoDJmnUxky//DFsq7YY81lKXm/3yleyr+F7CyBu1tUbctHSWHvFrkZN3h6X+KnnmRO/XPfy/MSJUGxlW1mRkDM6PC4A//uExO6B0/jxFA3kzcp7FiJVvL2hwspcRt17uCl0sCw4QA3ERrMKZObENENNQ9CBoOgkICG0wggCkiQiWnKUFwQYTTgRXbqozD8TURcpwpxRWUo2v6xFusOQCExfhFJPHoeA/bHkG5UOS8fk9pk6cdQm25XWZl+1r8AAQ5ZsVzat7EfkZGGZ0C1iDGzBwhecWwr9pto41Tpl1NukWWZ9bKZZw6YEuuz73xNWp/pNyMAAAp2Xap2JDTCW6hwVCuSFrBMwgYDLTSSzMwUkGS2IfZRGpS/sjl703oznlKDUjqITDKspveghzRUmR/szNmG5EvjqePEgkFkcJb62FaRJzhkR+v8Uj/JYRmUc9djHbt7SzUkyi3rsWVvpDlHJaTJR456yRp7WNC0rKoMJEg4MbgQgRWJhAkMhoWFDBQIECBoMwZnVHi/xr/OcNBgAyMIC//uExOyBk6V5Es0weMpjKyIlpg8RTBSgxMTkVEdIMSGAyoefYpxEAEoSxL6MQKwYcZMwcuQ8RhkMriFKkKsluESTOR6XsqssLFHHeqBn5Zy16G5C+0mvQBdq1HbdV3rc/NVaWdpqWxSEiJAxH4XrHFS6eQnSSbr+/62wz318psEmqLacVJzHV5XtdEjNTW0x/ysz87TvPYtm3Ne4VXN+yG5HgoPT4a2TUtLf5u0AS/YEE0YVgmcgAFSfQ1UFShFQs4JpMufTlfQXDwCPg0GGQsWvCEQdYc4hsgBmxjsI9l6XEDiwUA/Kpl8vkmAaITcWNX0QRACyBYd3HbYNTQqg3LHhkLEWvPXOQbJpu9ALJYFxrU9mAaLGNcyy/eR7RAZVUY10OGxE1wqIOan0jyzjW1aTQ4fD+ln7GpwGMtQ60tXvsZTBHNV94UznhSCGlINW//uExO8BD7FFH6wkdQL0qx/BvJn5PZZFTI8UOt3MAA1LVit2U24r5IcxYfMiEUAZtUya8FghKFJKw8fAZVElEQQU3TGiKxQGisgykyFRApTnLlijdW5oOtNmm4wiVxWVSl/YzYo39gFUoKAFQ9VB6t4PAGkpmhibpvri1izWUUbjUU0qySKuxdNz//iUkN9vxrBUWbk/I1/zHS/NClhPl7CO//yf//x+XypMQU1FMy4xMDCqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqAoUkOs2GQuCDo2ZMBGsmxqzyZVImTPhsKWNgBv58aw0mNthg//uExO8DlQF2+i3kb8I+lV3FvCGxKyY0hGVQZ55ZghFERAKLFmTFAEAawbQJtkSnbWHfiDorRW0yNpjfO7cjT6wDMXa0php9XibK9b+SOz3mWOWrFYKCDhEFLLLLS2qGoaOVI1lNYZGrBQYZAQSFkjG1iuMFWGQWFwzKhUWFjVbNkWDwVY+ZCRF3/XVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//uExK+D00zaug3kb4AAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV';
+function loadHit() {
+  try {
+    const bin = atob(HIT_B64), u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    AC.decodeAudioData(u8.buffer, buf => { HITBUF = buf; }, () => {});
+  } catch (e) {}
+}
+function loadSwoosh() {
+  try {
+    const bin = atob(SWOOSH_B64), u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    AC.decodeAudioData(u8.buffer, buf => {
+      SWOOSH = buf;
+      // instante do pico de energia, para o fazer coincidir com a pancada
+      const d = buf.getChannelData(0), w = Math.floor(buf.sampleRate * 0.02);
+      let best = 0, bi = 0;
+      for (let i = 0; i + w < d.length; i += w) {
+        let e = 0; for (let j = i; j < i + w; j++) e += d[j] * d[j];
+        if (e > best) { best = e; bi = i; }
+      }
+      SW_PEAK = (bi + w / 2) / buf.sampleRate;
+    }, () => {});
+  } catch (e) {}
+}
+const VOL = 0.9;
+function unlockAudio() {
+  try {
+    if (!AC) {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      const comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 4;
+      comp.attack.value = 0.002; comp.release.value = 0.12;
+      MASTER = AC.createGain(); MASTER.gain.value = G.muted ? 0 : VOL;
+      MLP = AC.createBiquadFilter(); MLP.type = 'lowpass'; MLP.frequency.value = 20000; MLP.Q.value = 0.7;
+      MASTER.connect(MLP); MLP.connect(comp); comp.connect(AC.destination);
+      // ruído branco reutilizável (estalidos, atrito, ar)
+      NOISE = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate);
+      const d = NOISE.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      // ruído rosa (mais suave e "arejado" do que o branco) para os sons de ar
+      PINK = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate);
+      const pk = PINK.getChannelData(0);
+      let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+      for (let i = 0; i < pk.length; i++) {
+        const w = Math.random() * 2 - 1;
+        b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759;
+        b2 = 0.96900 * b2 + w * 0.1538520; b3 = 0.86650 * b3 + w * 0.3104856;
+        b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+        pk[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11; b6 = w * 0.115926;
+      }
+      // eco do túnel (reverberação sintética, estéreo) — refeita a cada nível conforme o comprimento
+      CONV = AC.createConvolver();
+      const vlp = AC.createBiquadFilter(); vlp.type = 'lowpass'; vlp.frequency.value = 3400;
+      VERB = AC.createGain(); VERB.gain.value = 0.7;
+      VERB.connect(CONV); CONV.connect(vlp); vlp.connect(MASTER);
+      buildVerb(TD_TARGET);
+      loadSwoosh();
+      loadHit();
+      FLY = null;   // sem som contínuo de voo: o ar ouve-se em "whooshes" curtos (swing e passagem da bola)
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) {}
+}
+function setMuted(m) {
+  G.muted = m;
+  if (MASTER) MASTER.gain.setTargetAtTime(m ? 0 : VOL, AC.currentTime, 0.02);
+}
+const audioOn = () => AC && MASTER && !G.muted;
+
+// cadeia de saída: distância (0 = junto a ti, 1 = fundo do túnel) abafa e baixa o som; pan = posição lateral
+function out(pan = 0, dist = 0) {
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass';
+  lp.frequency.value = 15000 * Math.pow(0.22, dist);
+  const g = AC.createGain(); g.gain.value = 1 / (1 + dist * 1.8);
+  lp.connect(g);
+  if (VERB) { const sd = AC.createGain(); sd.gain.value = (0.1 + dist * 0.15) * verbScale(); g.connect(sd); sd.connect(VERB); }
+  if (AC.createStereoPanner) {
+    const p = AC.createStereoPanner(); p.pan.value = clamp(pan, -1, 1) * 0.75;
+    g.connect(p); p.connect(MASTER);
+  } else g.connect(MASTER);
+  return lp;
+}
+function noise(dst, t, type, f, q, dur, vol, f2) {
+  const s = AC.createBufferSource(); s.buffer = NOISE;
+  const fl = AC.createBiquadFilter(); fl.type = type; fl.frequency.setValueAtTime(f, t); fl.Q.value = q;
+  if (f2) fl.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + Math.min(0.003, dur * 0.2));
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s.connect(fl); fl.connect(g); g.connect(dst);
+  s.start(t, Math.random() * 1.5); s.stop(t + dur + 0.02);
+}
+function tone(dst, t, type, f0, f1, dur, vol, attack = 0.002) {
+  const o = AC.createOscillator(); o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(dst);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+// sino (parciais inarmónicas) para avisos de pontuação
+function bell(dst, t, f, dur, vol) {
+  tone(dst, t, 'sine', f, f, dur, vol, 0.004);
+  tone(dst, t, 'sine', f * 2.756, f * 2.756, dur * 0.45, vol * 0.3, 0.004);
+  tone(dst, t, 'sine', f * 5.404, f * 5.404, dur * 0.2, vol * 0.12, 0.004);
+}
+
+const sfx = {
+  // bola oca contra a raquete: estalido + "toc" ressonante + vibração da raquete + atrito se houver efeito
+  paddle(mine, spin, power) {
+    // raquetada de TÉNIS: estalo das cordas + baque abafado da bola de feltro + vibração do cordame
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001;
+      // a tua raquetada usa o mesmo carácter da do adversário (que soa bem), só mais próxima: sem graves pesados
+      const dst = out(ball.x / TX, mine ? 0.45 : 0.85);
+      const v = clamp(0.45 + power * 0.35, 0.35, 1) * (mine ? 1.25 : 1);
+      const pf = (0.95 + Math.random() * 0.1) * (1 - Math.min(power, 1.5) * 0.06);   // pancada forte: um pouco mais grave
+      if (mine && HITBUF) {
+        // a tua raquetada: som gravado de ténis (volume e tom conforme a força)
+        const src = AC.createBufferSource(); src.buffer = HITBUF;
+        src.playbackRate.value = pf;
+        const g = AC.createGain(); g.gain.value = 0.55 + 0.45 * clamp(power, 0, 1.5);
+        src.connect(g); g.connect(out(ball.x / TX, 0));
+        src.start(t);
+        if (spin > 0.5) {
+          const sN = Math.min(1, spin / CMAX);
+          noise(dst, t + 0.006, 'bandpass', 3600, 0.8, 0.05 + sN * 0.07, 0.04 + sN * 0.12, 2000);
+        }
+        return;
+      }
+      noise(dst, t, 'bandpass', 1900 * pf, 0.9, 0.018, 0.5 * v);                    // estalo das cordas
+      noise(dst, t + 0.002, 'lowpass', 900, 0.7, 0.03, 0.3 * v);                    // feltro da bola
+      tone(dst, t, 'sine', (mine ? 300 : 170) * pf, (mine ? 230 : 105) * pf, 0.06, (mine ? 0.18 : 0.5) * v, 0.002);   // "pock" (sem baque de tambor)
+      tone(dst, t, 'triangle', 540 * pf, 500 * pf, 0.16, 0.2 * v, 0.003);           // cordame a vibrar
+      tone(dst, t, 'sine', 1150 * pf, 1090 * pf, 0.09, 0.07 * v, 0.003);            // harmónico das cordas
+      if (spin > 0.5) {                                                              // cordas a raspar a bola (efeito)
+        const sN = Math.min(1, spin / CMAX);
+        noise(dst, t + 0.006, 'bandpass', 3600, 0.8, 0.05 + sN * 0.07, 0.05 + sN * 0.18, 2000);
+      }
+    } catch (e) {}
+  },
+
+  // ressalto na parede: mais seco e agudo; volume pela velocidade de impacto, abafado com a profundidade
+  wall(imp) {
+    if (!audioOn()) return;
+    const n = performance.now(); if (n - lastWall < 35) return; lastWall = n;
+    try {
+      const t = AC.currentTime + 0.001;
+      const dist = clamp(ball.z / TD, 0, 1);
+      const dst = out(ball.x / TX, dist);
+      const v = clamp(imp / 2.2, 0.12, 0.85);
+      const f = 1050 * (0.95 + Math.random() * 0.1);
+      noise(dst, t, 'bandpass', 2600, 1.4, 0.016, 0.45 * v);
+      tone(dst, t, 'sine', f * 1.2, f, 0.055, 0.38 * v);
+      tone(dst, t, 'sine', f * 2.4, f * 2.3, 0.025, 0.12 * v);
+    } catch (e) {}
+  },
+  // "whoosh": SÓ AR — ruído rosa filtrado, entrada que cresce e fade longo, sem tons nem ataques secos.
+  // power 0..1.5 · pan · dist (0 = junto a ti, 1 = fundo) · pitch · dir (sentido do gesto) · len · att (s até ao pico)
+  whoosh(power, pan = 0, dist = 0, pitch = 1, dir = 0, len = 1, att) {
+    if (!audioOn() || power <= 0.05) return;
+    try {
+      const t = AC.currentTime + 0.001;
+      const p = clamp(power, 0, 1.5);
+      const dur = (0.5 + p * 0.35) * len;
+      const at = att !== undefined ? att : (0.11 + p * 0.04) * len;
+      const lpD = AC.createBiquadFilter(); lpD.type = 'lowpass'; lpD.frequency.value = 15000 * Math.pow(0.22, dist);
+      const gD = AC.createGain(); gD.gain.value = 1 / (1 + dist * 1.8);
+      lpD.connect(gD);
+      let node = gD;
+      if (AC.createStereoPanner) {
+        const pn = AC.createStereoPanner();
+        pn.pan.setValueAtTime(clamp(pan - dir * 0.55, -1, 1) * 0.85, t);
+        pn.pan.linearRampToValueAtTime(clamp(pan + dir * 0.55, -1, 1) * 0.85, t + at + (dur - at) * 0.5);
+        gD.connect(pn); node = pn;
+      }
+      node.connect(MASTER);
+      if (VERB) { const send = AC.createGain(); send.gain.value = (0.4 + p * 0.15) * verbScale(); node.connect(send); send.connect(VERB); }
+      // som gravado: o pico do swoosh cai 'att' segundos depois (na pancada)
+      if (SWOOSH) {
+        const rate = clamp(1.15 - p * 0.2, 0.85, 1.2) * pitch * rnd(0.97, 1.03);
+        const lead = att !== undefined ? att : 0.12;
+        const off = Math.max(0, SW_PEAK - lead * rate);
+        const src = AC.createBufferSource(); src.buffer = SWOOSH; src.playbackRate.value = rate;
+        const g = AC.createGain(), vol = (0.08 + 0.18 * p) * len;
+        if (off > 0.05) { g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.035); }
+        else g.gain.setValueAtTime(vol, t);
+        // sem graves: o sopro não se mistura com a raquetada (evita o efeito de "batuque")
+        const hpw = AC.createBiquadFilter(); hpw.type = 'highpass'; hpw.frequency.value = 450; hpw.Q.value = 0.6;
+        src.connect(hpw); hpw.connect(g); g.connect(lpD);
+        src.start(t, off);
+        return;
+      }
+      // (alternativa sintetizada, enquanto o som gravado não estiver carregado)
+      // entrada em curva suave (sem arestas) e fade longo
+      const env = (g, peak) => {
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.setTargetAtTime(peak, t, at / 2.2);
+        g.gain.setTargetAtTime(0.0001, t + at, (dur - at) / 3.2);
+      };
+      const layer = (q, f0, f1, f2, lpf, peak) => {
+        const src = AC.createBufferSource(); src.buffer = PINK || NOISE;
+        const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = q;
+        bp.frequency.setValueAtTime(f0 * pitch, t);
+        bp.frequency.exponentialRampToValueAtTime(f1 * pitch, t + at);
+        bp.frequency.exponentialRampToValueAtTime(f2 * pitch, t + dur);
+        const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = lpf; lp.Q.value = 0.3;
+        const g = AC.createGain(); env(g, peak);
+        src.connect(bp); bp.connect(lp); lp.connect(g); g.connect(lpD);
+        src.start(t, Math.random() * 1.2); src.stop(t + dur + 0.1);
+      };
+      // um único sopro, grave e abafado (sem camada aguda, que soava a shaker/percussão)
+      layer(0.5, 260, 620 + p * 260, 180, 1300 + p * 250, 0.32 + p * 0.38);
+    } catch (e) {}
+  },
+  // falhaste: a bola passa por ti com um sopro e soa o aviso grave
+  lose() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001;
+      const dst = out(ball.x / TX, 0);
+      noise(dst, t, 'bandpass', 2200, 1.2, 0.35, 0.5, 250);
+      const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900; lp.connect(dst);
+      tone(lp, t + 0.18, 'sawtooth', 196, 98, 0.55, 0.22, 0.01);
+      tone(lp, t + 0.18, 'sawtooth', 147, 73, 0.6, 0.16, 0.01);
+    } catch (e) {}
+  },
+  // ponto teu: a bola some ao fundo e soa um sino
+  win() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001;
+      noise(out(ball.x / TX, 1), t, 'bandpass', 900, 1, 0.25, 0.25, 300);
+      const dst = out(0, 0);
+      bell(dst, t + 0.05, 880, 0.5, 0.22);
+      bell(dst, t + 0.16, 1318.5, 0.7, 0.2);
+    } catch (e) {}
+  },
+  extra() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.25, dst = out(0, 0);
+      [1046.5, 1318.5, 1568].forEach((f, i) => bell(dst, t + i * 0.07, f, 0.35, 0.14));
+    } catch (e) {}
+  },
+  level() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001, dst = out(0, 0);
+      [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => bell(dst, t + i * 0.12, f, 0.6, 0.2));
+    } catch (e) {}
+  },
+  // curto-circuito: crepitar elétrico aos solavancos + zumbido de corrente + estalo final
+  shortCircuit(segs) {
+    if (!audioOn()) return;
+    try {
+      const t0 = AC.currentTime + 0.01;
+      const dst = out(rnd(-0.6, 0.6), 0.3);
+      // zumbido (corrente a 100 Hz) que acompanha as quebras
+      const o = AC.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 100;
+      const bpz = AC.createBiquadFilter(); bpz.type = 'bandpass'; bpz.frequency.value = 700; bpz.Q.value = 1.2;
+      const gz = AC.createGain(); gz.gain.setValueAtTime(0.0001, t0);
+      o.connect(bpz); bpz.connect(gz); gz.connect(dst);
+      let t = t0;
+      for (const sg of segs) {
+        if (sg.dark > 0.3) {
+          gz.gain.setValueAtTime(0.05 + sg.dark * 0.07, t);
+          // estalidos dentro da quebra
+          const n = 2 + Math.floor(sg.d * 40);
+          for (let i = 0; i < n; i++) noise(dst, t + Math.random() * sg.d, 'highpass', rnd(2500, 6000), 0.7, rnd(0.008, 0.03), rnd(0.12, 0.35));
+        } else gz.gain.setValueAtTime(0.0001, t);
+        t += sg.d;
+      }
+      gz.gain.setValueAtTime(0.0001, t);
+      o.start(t0); o.stop(t + 0.05);
+      // estalo de quando a luz volta
+      noise(dst, t, 'bandpass', 1800, 0.8, 0.06, 0.45);
+      tone(dst, t, 'square', 1400, 180, 0.09, 0.08);
+    } catch (e) {}
+  },
+  // tempo-bala: o mundo abranda (som abafado e grave)
+  matrixIn() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.01;
+      if (MLP) { MLP.frequency.cancelScheduledValues(t); MLP.frequency.setValueAtTime(MLP.frequency.value, t); MLP.frequency.exponentialRampToValueAtTime(520, t + 0.4); }
+      this.whoosh(1.2, 0, 0, 0.42, 0, 1.4, 0.35);
+      const dst = out(0, 0);
+      tone(dst, t, 'sine', 90, 42, 1.7, 0.22, 0.25);          // queda grave do tempo a parar
+      tone(dst, t + 0.45, 'sine', 55, 55, 1.2, 0.08, 0.3);    // zumbido suspenso
+    } catch (e) {}
+  },
+  // explosão: o tempo volta de repente e a bola dispara
+  matrixOut() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.005;
+      if (MLP) { MLP.frequency.cancelScheduledValues(t); MLP.frequency.setValueAtTime(MLP.frequency.value, t); MLP.frequency.exponentialRampToValueAtTime(20000, t + 0.08); }
+      const dst = out(ball.x / TX, 0.2);
+      noise(dst, t, 'lowpass', 900, 0.7, 0.55, 0.9, 120);     // estrondo
+      noise(dst, t, 'bandpass', 2600, 0.8, 0.12, 0.5);         // estalo
+      tone(dst, t, 'sine', 110, 32, 0.6, 0.45, 0.004);         // impacto grave
+      this.whoosh(1.5, ball.x / TX, 0.2, 1.15, 0, 1, 0.06);
+    } catch (e) {}
+  },
+  net() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001, dst = out(ball.x / TX, 0.45);
+      noise(dst, t, 'lowpass', 700, 0.7, 0.14, 0.45);           // bola a bater na malha
+      noise(dst, t + 0.01, 'bandpass', 2400, 1.2, 0.09, 0.12);  // malha a vibrar
+      tone(dst, t, 'sine', 140, 90, 0.12, 0.15, 0.003);
+    } catch (e) {}
+  },
+  boomerang(dur) {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.01, half = dur * 0.47;
+      const src = AC.createBufferSource(); src.buffer = PINK || NOISE; src.loop = true;
+      const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 2.2;
+      bp.frequency.setValueAtTime(1300, t);
+      bp.frequency.exponentialRampToValueAtTime(520, t + half);     // afasta-se: mais grave (Doppler)
+      bp.frequency.exponentialRampToValueAtTime(1600, t + dur);     // regressa: mais agudo
+      const am = AC.createGain(); am.gain.value = 0.55;              // modulação = rotação
+      const lfo = AC.createOscillator(); lfo.type = 'triangle';
+      lfo.frequency.setValueAtTime(14, t); lfo.frequency.linearRampToValueAtTime(9, t + half); lfo.frequency.linearRampToValueAtTime(16, t + dur);
+      const ld = AC.createGain(); ld.gain.value = 0.45; lfo.connect(ld); ld.connect(am.gain);
+      const g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.9, t + 0.08);
+      g.gain.exponentialRampToValueAtTime(0.06, t + half);          // quase some ao longe
+      g.gain.exponentialRampToValueAtTime(1.0, t + dur);            // volta forte
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.35);
+      const dst = out(0, 0);
+      src.connect(bp); bp.connect(am); am.connect(g); g.connect(dst);
+      src.start(t); lfo.start(t); src.stop(t + dur + 0.4); lfo.stop(t + dur + 0.4);
+    } catch (e) {}
+  },
+  over() {
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001, dst = out(0, 0);
+      [392, 329.63, 261.63, 196].forEach((f, i) => bell(dst, t + i * 0.22, f, 0.9, 0.24));
+    } catch (e) {}
+  }
+};
+
+// sopro contínuo da bola em voo: mais forte e agudo quando se aproxima de ti
+// sons de ar por acontecimento: bola a passar junto a ti e gestos muito rápidos no ar
+// sons de ar: o swing começa antes do contacto e atinge o pico na pancada
+let armMe = true, armOp = true, lastSwingWhoosh = 0;
+const WH_LEAD = 0.3;   // começa até 0,3 s antes, com o pico exatamente no contacto
+function updateFlightSound() {
+  if (!AC) return;
+  const now = performance.now();
+  if (G.mode === 'play' && !G.paused) {
+    if (SQUASH) {
+      if (ball.vz > 0) { armMe = true; armOp = true; }
+      else if (G.turn === 'op') {
+        const tco = (ball.z - SQZ) / -ball.vz;
+        if (armOp && tco < WH_LEAD) { armOp = false; sfx.whoosh(0.5, op.x / TX, 0.25, 1, 0, 0.9, Math.max(0.02, tco - 0.07)); }
+      }
+    }
+    if (SQUASH && G.turn !== 'me') {}
+    else if (ball.vz < 0) {
+      armOp = true;
+      const tcm = ball.z / -ball.vz;
+      if (armMe && tcm < WH_LEAD) {
+        armMe = false; lastSwingWhoosh = now;
+        const v = strokeGesture(), pw = strokePower(v), sm = rigMe.smash > 0;
+        sfx.whoosh(sm ? 1.5 : 0.35 + pw * 0.95, me.x / TX, 0, sm ? 0.88 : 1,
+                   Math.sign(v.x) * Math.min(1, Math.abs(v.x) / 4), 1, Math.max(0.02, tcm - 0.07));
+      }
+    } else if (ball.vz > 0) {
+      armMe = true;
+      const tco = (TD - ball.z) / ball.vz;
+      if (armOp && tco < WH_LEAD) {
+        armOp = false;
+        sfx.whoosh(G.oppAttack ? 0.9 : 0.4, op.x / TX, 0.85, 1, 0, 0.9, tco);
+      }
+    }
+  } else { armMe = armOp = true; }
+  // gesto muito rápido no ar
+  const gs = Math.hypot(me.vx, me.vy);
+  if ((G.mode === 'play' || G.mode === 'serve') && gs > 7 && now - lastSwingWhoosh > 700) {
+    lastSwingWhoosh = now;
+    sfx.whoosh(clamp((gs - 6) / 8, 0.1, 0.5), me.x / TX, 0, 1, Math.sign(me.vx) * Math.min(1, Math.abs(me.vx) / 4), 0.8);
+  }
+}
+
+// --- Lógica de jogo ------------------------------------------------------
+function speed() {
+  // a velocidade acompanha parcialmente o comprimento do túnel
+  const base = Math.min(1.85 + 0.17 * (G.level - 1), 4.8) * Math.pow(TD / TD_BASE, TUN.speedExp);
+  // squash: o percurso é o dobro (ida à parede e volta) → bola mais rápida
+  return base * (SQUASH ? 1.45 : 1) * (1 + Math.min(G.rally, 12) * 0.025);   // a bola acelera ligeiramente durante a jogada
+}
+function setCurve(cx, cy) {
+  const m = Math.hypot(cx, cy);
+  if (m > CMAX) { cx *= CMAX / m; cy *= CMAX / m; }
+  ball.cx = cx; ball.cy = cy;
+}
+function newAIError() {
+  const e = Math.max(0.03, 0.17 - 0.013 * G.level);
+  op.ex = rnd(-e, e); op.ey = rnd(-e, e);
+}
+function banner(text, sub, dur = 1.4, color = '#e8fff0') {
+  G.banner = { text, sub, t: 0, dur, color };
+}
+function pop(text, color = '#9dff5a') {
+  return;   // sem mensagens flutuantes (o jogo fala por si)
+  G.pops.push({ text, color, t: 0 });
+  if (G.pops.length > 4) G.pops.shift();
+}
+function addScore(n) {
+  G.score += n;
+  if (G.score > G.hi) { G.hi = G.score; try { localStorage.setItem('vibeball_hi', String(G.hi)); } catch (e) {} }
+}
+
+function newGame() {
+  G.nextServer = 'me';
+  glitch.on = false; glitch.timer = rnd(20, 35); glitch.sparks.length = 0;
+  TD = TD_TARGET = TD_BASE;
+  ballHue = ballHueTarget = 100;
+  themeIdx = 0; themePending = null; visIdx = 1; visPending = null; NET = null;
+  buildVerb(TD_BASE);
+  shotMemory.length = 0; op.fam = 0;
+  G.score = 0; G.level = 1; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
+  SQUASH = false; squashPending = false;
+  G.pops.length = 0; G.served = 0;
+  op.x = op.y = 0;
+  banner('NÍVEL 1', '', 1.4);
+  toServe();
+}
+function toServe(keepFaults) {
+  G.boom = null; G.boomUsed = false; G.boomBonus = false;
+  G.toss = null;
+  if (!keepFaults) G.faults = 0;
+  MX.arm = null; MX.used = false;
+  if (MX.on) { MX.on = false; MX.scale = 1; if (MLP && AC) MLP.frequency.setTargetAtTime(20000, AC.currentTime, 0.05); }
+  fire.k = 0;
+  G.mode = 'serve';
+  G.rally = 0;
+  ball.vx = ball.vy = ball.vz = 0; ball.cx = ball.cy = 0;
+  ball.visible = true;
+  // a bola fica parada no centro do plano frontal; a raquete move-se livremente
+  G.server = G.nextServer || 'me';
+  ball.x = 0; ball.y = 0; ball.z = BR + 0.005;
+  if (G.server === 'op') { ball.z = SQUASH ? SQZ + BR + 0.01 : TD - BR - 0.005; G.opServe = { t: rnd(0.9, 1.4), toss: false, vy: 0 }; }
+}
+// força do golpe a partir do gesto: 0 = raquete parada (bloqueio), 1 = gesto rápido (ataque)
+function strokePower(v) { return clamp(Math.hypot(v.x, v.y) / 6, 0, 1); }
+
+// direção e velocidade de saída: a bola sai segundo a face da raquete (ângulo do gesto e da posição),
+// corrigida pelo ponto de impacto; o gesto dá potência e efeito
+function launch(px, py, v, mul, keep) {
+  const ox = clamp((ball.x - px) / PW, -1, 1);
+  const oy = clamp((ball.y - py) / PH, -1, 1);
+  const aim = faceAim(px, py, me.gx, me.gy);      // a mesma inclinação que se vê na face
+  ball.vz = speed() * mul;
+  // colocação: o ponto da raquete onde bates define o ângulo (como no Pong/Curveball original);
+  // a inclinação da face (gesto e posição) acrescenta um pouco; o gesto dá sobretudo efeito e força
+  ball.vx = ball.vx * keep * 0.5 + ox * DEFLECT * 0.95 + Math.tan(aim.ax) * ball.vz * 0.16;
+  ball.vy = ball.vy * keep * 0.5 + oy * DEFLECT * 0.8 + Math.tan(aim.ay) * ball.vz * 0.16;
+  setCurve(v.x * CURVE_K, v.y * CURVE_K);
+  return { ox, oy };
+}
+
+// varrimento: a raquete conta em todo o percurso dos últimos 90 ms, não só na posição atual —
+// num gesto rápido a bola é apanhada a meio do caminho, como num golpe verdadeiro.
+// Devolve a posição da raquete no ponto do percurso que apanhou a bola (ou null).
+function sweepHit() {
+  const now = performance.now();
+  const sm = rigMe.smash > 0;
+  const ex = (PW + BR * 0.9) * (sm ? 1.15 : 1), ey = (PH + BR * 0.9) * (sm ? 1.15 : 1);
+  let best = null, bd = Infinity;
+  const test = (x, y) => {
+    const dx = (ball.x - x) / ex, dy = (ball.y - y) / ey, d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = { x, y }; }
+  };
+  const pts = samples.filter(q => now - q.t <= (sm ? 160 : 90));
+  if (sm && rigMe.smashPos) test(rigMe.smashPos.x, rigMe.smashPos.y);   // remate: a posição no instante do clique também conta
+  pts.push({ x: me.x, y: me.y });
+  test(me.x, me.y);
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / 0.03));
+    for (let k = 0; k <= n; k++) test(a.x + (b.x - a.x) * k / n, a.y + (b.y - a.y) * k / n);
+  }
+  return bd <= 1 ? best : null;
+}
+// gesto usado no golpe: o atual ou, se tiveres abrandado mesmo antes do contacto, o recente
+function strokeGesture() {
+  const v = paddleVel();
+  return Math.hypot(v.x, v.y) >= Math.hypot(me.gx, me.gy) ? v : { x: me.gx, y: me.gy };
+}
+
+function serve() {
+  if (G.server === 'op') return;
+  if (Math.abs(TD - TD_TARGET) > 0.01 || G.warp) return;   // espera que o túnel acabe de mudar
+  // serviço: o primeiro clique lança sempre a bola ao ar; depois bate-se-lhe (clique ou gesto rápido através dela)
+  if (!G.toss) { G.toss = { vy: -1.55 }; sfx.whoosh(0.2, 0, 0, 1.4, 0, 0.5, 0.15); return; }
+  const hp = sweepHit();
+  if (!hp) return;
+  const v = strokeGesture();
+  const pw = strokePower(v);
+  const tossY = ball.y;
+  G.toss = null;
+  ball.vx = ball.vy = 0;
+  ball.z = BR + 0.005;
+  // bola lançada e apanhada no alto: pancada de cima para baixo, um pouco mais forte
+  const high = clamp(-tossY / 0.35, -1, 1);
+  launch(hp.x, hp.y, v, (0.85 + 0.3 * pw) * (1 + 0.12 * Math.max(0, high)), 0);
+  // no serviço a bola está parada: o gesto também aponta (permite servir para os cantos)
+  ball.vx += clamp(v.x * 0.13, -0.75, 0.75); ball.vy += clamp(v.y * 0.1, -0.5, 0.5);
+  // orientação vertical conforme a altura da bola no momento do golpe: alta → para baixo; baixa → para cima
+  ball.vy += clamp(-tossY * 1.4, -0.7, 0.7);
+  G.mode = 'play'; G.served++; G.lastBlock = pw < 0.15; G.turn = 'op';
+  aiObserve(true);
+  G.oppAttack = G.lastBlock && G.level >= 2 && Math.random() < 0.6;
+  rigOp.hard = G.oppAttack;
+  newAIError();
+  const m = Math.hypot(ball.cx, ball.cy);
+  sfx.paddle(true, m, 0.4 + pw * 0.6);
+  sfx.whoosh(0.3 + pw * 0.9, me.x / TX, 0, 1, Math.sign(v.x) * Math.min(1, Math.abs(v.x) / 4), 1, 0.06); lastSwingWhoosh = performance.now();
+  rigMe.vz += 3.5;
+  swingRig(rigMe, v.x, v.y, pw, me.x, me.y); addFlash(ball.x, ball.y, 0, PAL.me.glow);
+  if (pw > 0.9) ignite(0.45, '120,210,255');
+  if (m > 0.6) { const b = Math.round(m * 25) * 4; addScore(b); pop((m > 2.6 ? 'SUPER CURVA +' : 'CURVA +') + b); }
+}
+
+// clique durante a jogada: prepara um remate (vale se a bola chegar nos 0,25 s seguintes)
+function strike() {
+  rigMe.smash = 0.3;
+  rigMe.smashPos = { x: me.x, y: me.y };   // o clique marca 'bater aqui'
+  const tc = ball.vz < 0 ? ball.z / -ball.vz : Infinity;
+  if (tc > 0.4) { swingRig(rigMe, me.gx, me.gy, 0.8, me.x, me.y); sfx.whoosh(0.7, me.x / TX, 0, 0.9); lastSwingWhoosh = performance.now(); }   // golpe no vazio
+}
+
+function playerHit(hp) {
+  G.turn = 'op';
+  ball.z = Math.abs(ball.z);              // reflexão no plano da raquete
+  const v = strokeGesture();
+  const pw = strokePower(v);
+  const smash = rigMe.smash > 0;
+  G.rally++;
+  // parada = bloqueio lento; gesto rápido = ataque; clique na altura certa = remate
+  let mul = 0.78 + 0.32 * pw;
+  if (smash) mul *= 1.28;
+  const { ox, oy } = launch(hp.x, hp.y, v, mul, 0.25);
+  G.lastBlock = pw < 0.15 && !smash;
+  aiObserve(false);
+  newAIError();
+  sfx.paddle(true, Math.hypot(ball.cx, ball.cy), smash ? 1.5 : 0.35 + pw * 0.75);
+  swingRig(rigMe, v.x, v.y, smash ? 1.4 : pw, me.x, me.y); addFlash(ball.x, ball.y, 0, PAL.me.glow);
+  rigMe.smash = 0;
+  G.oppAttack = G.lastBlock && G.level >= 2 && Math.random() < 0.6;
+  rigOp.hard = G.oppAttack;
+
+  if (G.lastBlock) { addScore(50); pop('BLOQUEIO +50', '#b8c4cc'); }
+  else addScore(100);
+  if (smash) {
+    addScore(150); pop('REMATE +150', '#ffd27a');
+    ignite(1, '255,190,70'); G.shake = 0.3;
+    addFlash(ball.x, ball.y, 0.02, '255,220,120', 2.5, 0.35);  // onda de choque
+  } else if (pw > 0.85) ignite(0.45, '120,210,255');            // ataque forte: rasto azul
+  else fire.k = 0;
+  if (smash || pw > 0.7) matrixArm('me', 0.14);                  // raquetada forte: talvez tempo-bala
+  if (Math.abs(ox) < 0.2 && Math.abs(oy) < 0.2) { addScore(200); pop('CENTRO +200', '#7fd4ff'); }
+  const m = Math.hypot(ball.cx, ball.cy);
+  if (m > 0.6) {
+    const b = Math.round(m * 25) * 4;
+    addScore(b);
+    pop((m > 2.6 ? 'SUPER CURVA +' : 'CURVA +') + b);
+  }
+}
+
+// aponta a bola a uma parede (lateral, teto ou chão) para ressaltar até à zona do jogador
+function wallAim(tfs) {
+  let w = Math.floor(Math.random() * 4);
+  if (NET && w === 3) w = 2;   // com rede não ressalta no chão
+  const ax = rnd(-0.45, 0.45), ay = rnd(-0.35, 0.35);
+  if (w < 2) { const sx2 = w === 0 ? -1 : 1; ball.vx = clamp((2 * LX * sx2 - ax - ball.x) / tfs, -2.4, 2.4); ball.vy = clamp((ay - ball.y) / tfs, -1.2, 1.2); }
+  else       { const sy2 = w === 2 ? -1 : 1; ball.vy = clamp((2 * LY * sy2 - ay - ball.y) / tfs, -2.2, 2.2); ball.vx = clamp((ax - ball.x) / tfs, -1.3, 1.3); }
+}
+function oppHit(weak, isServe) {
+  G.turn = 'me';
+  ball.z = 2 * TD - ball.z;
+  const L = G.level;
+  const ox = clamp((ball.x - op.x) / PW, -1, 1);
+  const oy = clamp((ball.y - op.y) / PH, -1, 1);
+  // uma bola bloqueada (lenta) convida o adversário a atacar
+  let mul = 1;
+  if (G.oppAttack && !weak) mul = Math.min(1.12 + 0.02 * L, 1.35);
+  if (weak) mul = 0.72;
+  ball.vz = -speed() * mul;
+  // escolhe um ponto de chegada: às vezes procura o lado oposto à tua raquete (mais vezes nos níveis altos),
+  // às vezes joga para uma zona mais central — bolas legíveis, sem exageros
+  op.read = false;
+  const away = !weak && Math.random() < Math.min(0.1 + 0.045 * L, 0.7);
+  const sx = me.x === 0 ? (Math.random() < 0.5 ? -1 : 1) : -Math.sign(me.x);
+  const sy = me.y === 0 ? (Math.random() < 0.5 ? -1 : 1) : -Math.sign(me.y);
+  const tgx = away ? sx * rnd(0.3, 0.45 + Math.min(L, 8) * 0.03) : rnd(-0.3, 0.3) + me.x * 0.4;
+  const tgy = away ? sy * rnd(0.1, 0.4) : rnd(-0.2, 0.2) + me.y * 0.4;
+  const tf = TD / Math.abs(ball.vz);
+  ball.vx = clamp((tgx - ball.x) / tf + ox * 0.15 + rnd(-0.1, 0.1), -1.3, 1.3);
+  ball.vy = clamp((tgy - ball.y) / tf + oy * 0.12 + rnd(-0.1, 0.1), -1.1, 1.1);
+  // efeito do adversário: cresce devagar com o nível e tem limite
+  const cm = weak ? 0 : Math.min(0.09 * (L - 1), 1.8) * Math.sqrt(Math.random());
+  const ang = Math.random() * Math.PI * 2;
+  setCurve(Math.cos(ang) * cm + op.vx * CURVE_K * 0.4, Math.sin(ang) * cm + op.vy * CURVE_K * 0.4);
+  // durante a jogada também joga contra as paredes (mais vezes nos níveis altos)
+  if (!weak && !isServe && Math.random() < Math.min(0.12 + 0.025 * L, 0.35)) {
+    wallAim(TD / Math.abs(ball.vz));
+    setCurve(ball.cx * 0.4, ball.cy * 0.4);
+  }
+  if (isServe) {
+    // serviço do adversário: varia o tipo — plano, a descer, a subir, ao canto ou com efeito lateral
+    const styles = ['plano', 'desce', 'sobe', 'canto', 'efeito', 'parede', 'parede'];
+    const stl = styles[Math.floor(Math.random() * styles.length)];
+    const sd = Math.random() < 0.5 ? -1 : 1, sv = Math.random() < 0.5 ? -1 : 1;
+    const ce = Math.min(0.5 + 0.08 * (L - 1), 1.8);            // efeito máximo (cresce com o nível)
+    let tx = rnd(-0.35, 0.35), ty = rnd(-0.2, 0.2), cx = 0, cy = 0, sm = rnd(0.92, 1.08);
+    if (stl === 'desce')  { ty = rnd(0.3, 0.5);   cy = ce * rnd(0.3, 0.7); }        // bate no alto e cai a pique
+    if (stl === 'sobe')   { ty = rnd(-0.5, -0.3); cy = -ce * rnd(0.2, 0.5); }       // sai baixo e sobe
+    if (stl === 'canto')  { tx = sd * rnd(0.45, 0.65); ty = sv * rnd(0.25, 0.45); sm *= 1.05; }
+    if (stl === 'efeito') { tx = -sd * rnd(0.1, 0.35); cx = sd * ce * rnd(0.6, 1); cy = rnd(-0.3, 0.3); }   // curva para o lado
+    ball.vz = -speed() * sm;
+    const tfs = TD / Math.abs(ball.vz);
+    // aponta descontando a deriva do efeito (a bola chega perto do alvo, mas a curva vê-se)
+    ball.vx = clamp((tx - ball.x) / tfs - 0.5 * cx * tfs * 0.6, -1.3, 1.3);
+    ball.vy = clamp((ty - ball.y) / tfs - 0.5 * cy * tfs * 0.6, -1.2, 1.2);
+    if (stl === 'parede') { wallAim(tfs); cx = 0; cy = 0; }   // ressalto numa parede antes de chegar a ti
+    setCurve(cx, cy);
+  }
+  // com rede: garante que a bola passa por cima (ajusta a altura do arco)
+  if (NET && G.forceNet) {
+    // serviço falhado: sai baixo e bate na rede
+    const tm = Math.max(0.05, (ball.z - TD / 2) / Math.abs(ball.vz));
+    ball.cy = 0; ball.cx *= 0.3;
+    ball.vy = clamp((NET.top + rnd(0.08, 0.22) - ball.y) / tm, -2.2, 2.2);
+  } else if (NET) {
+    const tm = Math.max(0.05, (ball.z - TD / 2) / Math.abs(ball.vz));
+    const yMid = ball.y + ball.vy * tm + 0.5 * ball.cy * tm * tm;
+    if (yMid > NET.top - BR - 0.06) {
+      const want = NET.top - 0.14 - rnd(0, 0.22);
+      ball.vy = clamp((want - ball.y - 0.5 * ball.cy * tm * tm) / tm, -2.2, 2.2);
+    }
+  }
+  // decide já a força do próximo golpe para a animação de preparação
+  sfx.paddle(false, Math.hypot(ball.cx, ball.cy), mul > 1 ? 1.4 : 0.8);
+  swingRig(rigOp, op.vx, op.vy, mul > 1 ? 1.4 : 0.6, op.x, op.y);
+  addFlash(ball.x, ball.y, TD, PAL.op.glow);
+  if (mul > 1) { ignite(0.75, '255,80,60'); addFlash(ball.x, ball.y, TD, '255,120,90', 3, 0.35); if (L >= 3) matrixArm('op', 0.1); }
+  else fire.k = 0;
+}
+
+// falha no serviço (bola falhada ou à rede): a 1.ª repete-se; à 2.ª seguida o serviço passa para o outro
+function serveFault() {
+  G.faults = (G.faults || 0) + 1;
+  G.mode = 'miss'; G.timer = 0.9; G.after = 'fault';
+}
+// --- Bumerangue (raro e inesperado): numa bola que o adversário falha, a bola segue até ao "infinito",
+// faz a curva e volta em arco para ti; o jogo continua. Se voltares a ganhar o ponto, vale pontos extra.
+function tryBoomerang() {
+  if (G.boomUsed || G.warp || Math.random() > 0.085) return false;
+  G.boomUsed = true; G.boomBonus = true;
+  const sp = Math.max(ball.vz, speed());
+  G.boom = { t: 0, z0: ball.z, x0: ball.x, y0: ball.y, ex: rnd(-0.5, 0.5), ey: rnd(-0.35, 0.3),
+             far: TD + rnd(4.5, 6), sp, dir: Math.random() < 0.5 ? -1 : 1, T1: 1.0, T2: 1.1 };
+  G.mode = 'boom';
+  sfx.boomerang(G.boom.T1 + G.boom.T2);
+  return true;
+}
+function updateBoomerang(dt) {
+  const b = G.boom; if (!b) return;
+  b.t += dt;
+  const T1 = b.T1, T2 = b.T2;
+  if (b.t < T1) {
+    // vai até ao infinito, a desviar-se num arco largo
+    const u = b.t / T1, e = 1 - (1 - u) * (1 - u);
+    ball.z = b.z0 + (b.far - b.z0) * e;
+    ball.x = b.x0 + b.dir * 0.9 * Math.sin(u * Math.PI * 0.5);
+    ball.y = b.y0 - 0.25 * Math.sin(u * Math.PI);
+  } else {
+    // regressa em arco (como um bumerangue) e reentra no túnel em direção a ti
+    const u = Math.min(1, (b.t - T1) / T2), e = u * u;
+    const zIn = TD - 0.02;
+    ball.z = b.far + (zIn - b.far) * e;
+    const xs = b.x0 + b.dir * 0.9, xm = -b.dir * 1.1;
+    ball.x = xs + (xm - xs) * Math.sin(u * Math.PI * 0.5) * (1 - u) + (b.ex - xs) * u * u;
+    ball.y = (b.y0 - 0.0) * (1 - u) + b.ey * u + 0.2 * Math.sin(u * Math.PI);
+    if (u >= 1) {
+      // de volta ao jogo: vem para ti com o giro do bumerangue
+      G.boom = null; G.mode = 'play';
+      ball.z = zIn; ball.vz = -b.sp * 1.05;
+      const tf = TD / Math.abs(ball.vz);
+      ball.vx = clamp(rnd(-0.4, 0.4) / tf, -1, 1); ball.vy = clamp(rnd(-0.25, 0.25) / tf, -0.8, 0.8);
+      setCurve(-b.dir * rnd(0.8, 1.6), rnd(-0.4, 0.4));
+      op.react = 0.3;
+    }
+  }
+  ball.rot += 18 * dt;   // gira depressa
+}
+function squashOppHit(isServe) {
+  G.turn = 'me';
+  const L = G.level;
+  ball.z = SQZ + 0.01;
+  ball.vz = speed() * rnd(0.95, 1.1);
+  const ttot = ((TD - ball.z) + TD) / ball.vz;          // até à parede e de volta ao teu plano
+  const away = Math.random() < Math.min(0.15 + 0.045 * L, 0.7);
+  const sx = me.x === 0 ? (Math.random() < 0.5 ? -1 : 1) : -Math.sign(me.x);
+  const tx = away ? sx * rnd(0.3, 0.65) : rnd(-0.35, 0.35);
+  const ty = rnd(-0.35, 0.4);
+  ball.vx = clamp((tx - ball.x) / ttot, -1.3, 1.3);
+  ball.vy = clamp((ty - ball.y) / ttot, -1.1, 1.1);
+  const cm = Math.min(0.08 * (L - 1), 1.3) * Math.sqrt(Math.random()), ang = Math.random() * Math.PI * 2;
+  setCurve(Math.cos(ang) * cm, Math.sin(ang) * cm);
+  if (!isServe && Math.random() < Math.min(0.12 + 0.025 * L, 0.35)) wallAim(ttot);
+  fire.k = 0;
+  sfx.paddle(false, Math.hypot(ball.cx, ball.cy), 0.9);
+  swingRig(rigOp, op.vx, op.vy, 0.7, op.x, op.y);
+  addFlash(ball.x, ball.y, SQZ, PAL.op.glow);
+}
+function missMe() {
+  const dbl = G.boomBonus; G.boomBonus = false;   // ponto do bumerangue vale a dobrar (também para o adversário)
+  G.mode = 'miss'; G.timer = 1.25;
+  G.nextServer = 'op';          // perdeste o ponto: serve o adversário
+  sfx.lose();
+  // contagem do ténis: 4 pontos com 2 de vantagem (com iguais/vantagem)
+  G.po = (G.po || 0) + (dbl ? 2 : 1);
+  if (G.po >= 4 && G.po - (G.pm || 0) >= 2) {
+    G.lives--;                  // perdeste o jogo (nível): perdes uma bola e repetes o nível
+    G.levelLosses = (G.levelLosses || 0) + 1;
+    G.after = (G.lives <= 0 || G.levelLosses >= 3) ? 'gameover' : 'regame';   // 3 jogos perdidos no mesmo nível: fim
+  } else G.after = 'serve';
+}
+function missOpp() {
+  G.mode = 'miss'; G.timer = 1.25;
+  G.pm = (G.pm || 0) + (G.boomBonus ? 2 : 1);   // ponto do bumerangue vale a dobrar
+  G.nextServer = 'me';          // ganhaste o ponto: serves tu
+  const fast = Math.max(250, 2000 - Math.max(0, G.rally - 1) * 175);
+  if (G.boomBonus) { G.boomBonus = false; addScore(3000 * G.level); sfx.extra(); }   // ganhaste outra vez depois do bumerangue
+  addScore(fast);
+  sfx.win();
+  // serviço direto (ás): o adversário não devolveu o teu serviço.
+  // A cada 3 ases — seguidos ou intercalados com outros pontos — ganhas uma bola extra.
+  const ace = G.rally === 0 && G.server !== 'op';
+  let extra = false;
+  if (ace) {
+    G.aces = (G.aces || 0) + 1;
+    const k = G.aces % 3 === 0 ? 3 : G.aces % 3;
+    if (k === 3 && G.lives < MAX_LIVES) { G.lives++; extra = true; pop('3 ASES · +1 BOLA', '#7fd4ff'); sfx.extra(); }
+    else pop('SERVIÇO DIRETO ' + k + '/3', '#7fd4ff');
+  }
+  const head = ace ? 'ÁS!' : 'PONTO!';
+  if (G.pm >= 4 && G.pm - (G.po || 0) >= 2) {   // ganhaste o jogo (nível)
+    const lb = 1000 * G.level;
+    addScore(lb);
+    G.after = 'level';
+
+  } else {
+    G.after = 'serve';
+
+  }
+}
+
+// --- Física da bola -------------------------------------------------------
+function physics(h) {
+  // curva: aceleração lateral constante na direção do efeito
+  ball.vx += ball.cx * h;
+  ball.vy += ball.cy * h;
+  const sp = Math.hypot(ball.vx, ball.vy);
+  if (sp > VMAX) { ball.vx *= VMAX / sp; ball.vy *= VMAX / sp; }
+  const d = Math.exp(-SPIN_DECAY * h);
+  ball.cx *= d; ball.cy *= d;
+
+  ball.x += ball.vx * h;
+  ball.y += ball.vy * h;
+  ball.z += ball.vz * h;
+  ball.rot += (Math.hypot(ball.cx, ball.cy) * 4 + 1.2) * h;
+
+  // paredes: reflexão especular; o atrito com a parede consome parte da rotação.
+  // A curva mantém a direção — por isso uma bola com muito efeito volta a "colar" à parede.
+  let hit = false;
+  const ivx = Math.abs(ball.vx), ivy = Math.abs(ball.vy);
+  if (ball.x > LX)       { ball.x = 2 * LX - ball.x;  ball.vx = -Math.abs(ball.vx); ball.cx *= 0.55; ball.cy *= 0.9; hit = true; }
+  else if (ball.x < -LX) { ball.x = -2 * LX - ball.x; ball.vx =  Math.abs(ball.vx); ball.cx *= 0.55; ball.cy *= 0.9; hit = true; }
+  if (ball.y > LY)       { ball.y = 2 * LY - ball.y;  ball.vy = -Math.abs(ball.vy); ball.cy *= 0.55; ball.cx *= 0.9; hit = true; }
+  else if (ball.y < -LY) { ball.y = -2 * LY - ball.y; ball.vy =  Math.abs(ball.vy); ball.cy *= 0.55; ball.cx *= 0.9; hit = true; }
+  if (hit && G.mode !== 'title') sfx.wall(Math.max(ivx, ivy));
+}
+
+function hitTest(p) {
+  // cabeça oval: teste elíptico com margem para o raio da bola
+  const dx = (ball.x - p.x) / (PW + BR * 0.6), dy = (ball.y - p.y) / (PH + BR * 0.6);
+  return dx * dx + dy * dy <= 1;
+}
+
+// --- Inteligência do adversário -----------------------------------------
+// velocidade máxima, tempo de reação e antecipação melhoram a cada nível
+// =========================================================================
+//  ADVERSÁRIO
+//  · Lê a trajetória com ressaltos nas paredes (bolas fortes contra a parede já não o enganam),
+//    mas só "vê" o efeito (curva) aos poucos — quanto mais alto o nível, mais cedo o lê.
+//  · Tem inércia (aceleração limitada) e recupera devagar para o centro depois de bater:
+//    puxá-lo para um lado e jogar rápido para o outro é a forma de lhe ganhar pontos.
+//  · Erra mais com bolas rápidas, com efeito e em jogadas longas (cansaço).
+// =========================================================================
+const TUN = { speedExp: 0.75, aiExp: 0.4 };   // calibração por comprimento do túnel
+const AI = {
+  skill: L => Math.min(0.8, 0.14 + 0.05 * (L - 1)),      // leitura do jogo (0..1) — cresce até ~nível 15
+  vmax:  L => Math.min(0.68 + 0.085 * (L - 1), 1.95),     // velocidade máxima
+  amax:  L => Math.min(2.4 + 0.36 * (L - 1), 7.5),          // aceleração máxima (inércia)
+  react: L => Math.max(0.06, 0.22 - 0.012 * (L - 1)),     // tempo de reação a cada bola
+  recover: 0.55                                            // velocidade relativa de recuperação para o centro
+};
+let aiPlanT = 0;
+// squash: trajetória até à parede do fundo e de volta até ao plano do adversário
+function predictSquash(b) {
+  let { x, y, z, vx, vy, vz, cx, cy } = b;
+  for (let i = 0; i < 4000; i++) {
+    const h = SUBSTEP;
+    vx += cx * h; vy += cy * h;
+    const sp = Math.hypot(vx, vy); if (sp > VMAX) { vx *= VMAX / sp; vy *= VMAX / sp; }
+    const d = Math.exp(-SPIN_DECAY * h); cx *= d; cy *= d;
+    x += vx * h; y += vy * h; z += vz * h;
+    if (x > LX) { x = 2 * LX - x; vx = -Math.abs(vx); cx *= 0.55; cy *= 0.9; }
+    else if (x < -LX) { x = -2 * LX - x; vx = Math.abs(vx); cx *= 0.55; cy *= 0.9; }
+    if (y > LY) { y = 2 * LY - y; vy = -Math.abs(vy); cy *= 0.55; cx *= 0.9; }
+    else if (y < -LY) { y = -2 * LY - y; vy = Math.abs(vy); cy *= 0.55; cx *= 0.9; }
+    if (z >= TD && vz > 0) { z = 2 * TD - z; vz = -vz; }
+    if (vz < 0 && z <= SQZ) break;
+  }
+  return { x, y };
+}
+const predictFor = b => SQUASH ? predictSquash(b) : predictArrival(b);
+const aiIncoming = () => SQUASH ? G.turn === 'op' : ball.vz > 0;
+function aiPlan(fresh, isServe) {
+  // previsão: ressaltos sempre; o efeito só na proporção do que já consegue ler
+  const L = G.level, sk = AI.skill(L);
+  const pL = predictFor({ ...ball, cx: 0, cy: 0 });
+  const pC = predictFor(ball);
+  const prog = SQUASH ? clamp((ball.vz > 0 ? ball.z : 2 * TD - ball.z) / (2 * TD - SQZ), 0, 1) : clamp(ball.z / TD, 0, 1);                   // a curva torna-se evidente à medida que a bola avança
+  const k = op.read ? 1 : clamp(sk * 0.35 + (op.fam || 0) * 0.45 + (1 - sk * 0.35) * prog * prog * 0.45, 0, 1);
+  if (fresh) {
+    // erro fixo por bola: maior com bola rápida, com muito efeito e em jogadas longas
+    const sp = Math.abs(ball.vz) / 2.2, spin = Math.hypot(ball.cx, ball.cy) / CMAX;
+    // bolas colocadas nos cantos/junto às paredes são mais difíceis de devolver
+    const corner = Math.max(0, Math.abs(pC.x) - 0.55) / 0.4 + Math.max(0, Math.abs(pC.y) - 0.4) / 0.3;
+    // o erro depende da QUALIDADE da bola (velocidade, efeito, colocação): bolas fracas são sempre devolvidas
+    const e = ((0.02 + 0.13 * (1 - sk)) * (0.35 + 0.55 * sp + 0.85 * spin) + 0.01 * Math.max(0, Math.min(G.rally, 15) - 4)) * (1 + 1.5 * corner);
+    const eS = SQUASH ? e * 1.7 : e;
+    op.ex = rnd(-eS, eS); op.ey = rnd(-eS, eS) * 0.8;
+    // squash: mais errático — às vezes lê mal a bola que volta da parede
+    if (SQUASH && Math.random() < 0.05 + 0.008 * Math.min(G.rally, 10)) op.ex += (Math.random() < 0.5 ? -1 : 1) * rnd(0.3, 0.5);
+    // de vez em quando lê mal a bola (mesmo uma bola simples): as jogadas não se eternizam
+    if (G.rally > 6 && Math.random() < 0.006 * (Math.min(G.rally, 20) - 6)) {   // só o cansaço em jogadas longas
+      op.ex += (Math.random() < 0.5 ? -1 : 1) * rnd(0.28, 0.45); }
+    op.react = AI.react(L) * Math.sqrt(TD / TD_BASE) * (SQUASH ? 1.4 : 1);   // túnel curto: reage mais depressa
+    // serviço: quanto mais alto o nível, mais vezes "lê" o serviço logo à partida (arranca já para o lado certo)
+    op.read = isServe && Math.random() < Math.min(0.15 + 0.09 * (L - 1), 0.9);
+    if (isServe) {   // à espera do serviço: mais atento — cada vez mais com o nível (ases um pouco mais difíceis)
+      const ready = Math.min(1, (L - 1) / 10);
+      op.react *= 0.6 - 0.25 * ready; op.ex *= 0.7 - 0.3 * ready; op.ey *= 0.7 - 0.3 * ready;
+    }
+    if (op.read) { op.react = 0; op.ex *= 0.5; op.ey *= 0.5; }
+  }
+  // ressaltos: nos níveis baixos não os antecipa — só os percebe a meio do caminho (ou depois de acontecerem)
+  const tRem = SQUASH ? (ball.vz > 0 ? (2 * TD - ball.z - SQZ) : (ball.z - SQZ)) / Math.max(Math.abs(ball.vz), 0.3) : (TD - ball.z) / Math.max(ball.vz, 0.3);
+  const pN = { x: clamp(ball.x + ball.vx * tRem, -PX, PX), y: clamp(ball.y + ball.vy * tRem, -PY, PY) };
+  const kb = op.read ? 1 : clamp(0.2 + sk * 0.9 + prog * 1.1, 0, 1);
+  const bx = pN.x + (pL.x - pN.x) * kb, by = pN.y + (pL.y - pN.y) * kb;
+  op.px = bx + (pC.x - pL.x) * k + op.ex;
+  op.py = by + (pC.y - pL.y) * k + op.ey;
+}
+function aiUpdate(dt) {
+  const L = G.level;
+  // túnel longo dá-lhe mais tempo → um pouco mais lento (e o contrário nos curtos): dificuldade parecida em todos
+  const tdk = Math.pow(TD_BASE / TD, TUN.aiExp);
+  let vm = AI.vmax(L) * tdk * Math.max(0.8, 1 - 0.012 * Math.min(G.rally, 15));
+  const am = AI.amax(L) * tdk * (SQUASH ? 0.8 : 1);
+  if (SQUASH) vm *= 0.8;
+  let tx, ty;
+  if (G.mode === 'play' && aiIncoming()) {
+    op.react = Math.max(0, (op.react || 0) - dt);
+    aiPlanT -= dt;
+    if (aiPlanT <= 0) { aiPlan(false); aiPlanT = 0.08; }
+    if (op.react > 0) { tx = op.x + op.vx * 0.05; ty = op.y + op.vy * 0.05; }   // ainda a reagir
+    else { tx = op.px; ty = op.py; }
+  } else if (G.mode === 'title') {
+    tx = ball.x * 0.6; ty = ball.y * 0.6; vm *= 0.6;
+  } else {
+    // bola a afastar-se (ou serviço): recupera devagar para perto do centro
+    tx = op.x * 0.5; ty = op.y * 0.5; vm *= AI.recover;
+    if (G.mode === 'serve') {
+      tx = 0; ty = 0;
+      if (G.server !== 'op') {
+      const sv = shotMemory.filter(m => m.s).slice(-3);      // antecipa o lado dos teus últimos serviços
+      if (sv.length) {
+        const kk = Math.min(1, sv.length * 0.35) * 0.6;
+        tx = sv.reduce((a2, m) => a2 + m.ax, 0) / sv.length * kk;
+        ty = sv.reduce((a2, m) => a2 + m.ay, 0) / sv.length * kk;
+      }
+      }
+    }
+  }
+  tx = clamp(tx, -PX, PX); ty = clamp(ty, -PY, PY);
+  // movimento com inércia: acelera até vm e trava para chegar ao alvo
+  const dx = tx - op.x, dy = ty - op.y, dist = Math.hypot(dx, dy);
+  const want = Math.min(vm, Math.sqrt(2 * am * dist) * 0.95);
+  const dvx = (dist > 1e-4 ? dx / dist * want : 0) - op.vx, dvy = (dist > 1e-4 ? dy / dist * want : 0) - op.vy;
+  const dm = Math.hypot(dvx, dvy), lim = am * dt;
+  if (dm > lim) { op.vx += dvx / dm * lim; op.vy += dvy / dm * lim; } else { op.vx += dvx; op.vy += dvy; }
+  op.x = clamp(op.x + op.vx * dt, -PX, PX); op.y = clamp(op.y + op.vy * dt, -PY, PY);
+  if (Math.abs(op.x) >= PX) op.vx = 0;
+  if (Math.abs(op.y) >= PY) op.vy = 0;
+}
+
+// --- Memória do adversário --------------------------------------------------
+// Cada jogada tua fica registada (ponto de saída, direção, velocidade e efeito).
+// Uma jogada parecida com as anteriores é "lida": o adversário prevê onde a bola
+// vai chegar — com curva e ressaltos — e posiciona-se cedo. Repetir é castigado.
+const shotMemory = [];
+function predictArrival(b) {
+  let { x, y, z, vx, vy, vz, cx, cy } = b;
+  for (let i = 0; i < 2400 && z < TD; i++) {
+    const h = SUBSTEP;
+    vx += cx * h; vy += cy * h;
+    const sp = Math.hypot(vx, vy); if (sp > VMAX) { vx *= VMAX / sp; vy *= VMAX / sp; }
+    const d = Math.exp(-SPIN_DECAY * h); cx *= d; cy *= d;
+    x += vx * h; y += vy * h; z += vz * h;
+    if (x > LX) { x = 2 * LX - x; vx = -Math.abs(vx); cx *= 0.55; cy *= 0.9; }
+    else if (x < -LX) { x = -2 * LX - x; vx = Math.abs(vx); cx *= 0.55; cy *= 0.9; }
+    if (y > LY) { y = 2 * LY - y; vy = -Math.abs(vy); cy *= 0.55; cx *= 0.9; }
+    else if (y < -LY) { y = -2 * LY - y; vy = Math.abs(vy); cy *= 0.55; cx *= 0.9; }
+  }
+  return { x, y };
+}
+function aiObserve(isServe) {
+  const sig = { s: isServe, x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy, cx: ball.cx, cy: ball.cy };
+  // familiaridade: cada jogada semelhante já vista aumenta a leitura
+  let miss = 1;
+  for (const m of shotMemory) {
+    const d = Math.abs(sig.x - m.x) / 0.45 + Math.abs(sig.y - m.y) / 0.35 +
+              Math.abs(sig.vx - m.vx) / 0.5 + Math.abs(sig.vy - m.vy) / 0.45 +
+              Math.abs(sig.cx - m.cx) / 1.0 + Math.abs(sig.cy - m.cy) / 1.0 +
+              (sig.s !== m.s ? 0.6 : 0);
+    const w = clamp(1 - d / 1.6, 0, 1);
+    miss *= 1 - 0.7 * w;
+  }
+  const pr = predictArrival(ball);
+  sig.ax = pr.x; sig.ay = pr.y;
+  op.fam = (1 - miss) * 0.8;          // jogada repetida: lê-a melhor
+  shotMemory.push(sig);
+  if (shotMemory.length > 10) shotMemory.shift();
+  aiPlan(true, isServe); aiPlanT = 0.08;
+}
+
+// --- Atualização ----------------------------------------------------------
+function update(dt) {
+  // transição suave do comprimento do túnel (estica/encolhe à tua frente)
+  if (TD !== TD_TARGET) {
+    TD += (TD_TARGET - TD) * (1 - Math.exp(-dt * 3.2));
+    if (Math.abs(TD - TD_TARGET) < 0.002) TD = TD_TARGET;
+  }
+  if (input.touch) { const h = headFrom(input.fx, input.fy); input.x = h.x; input.y = h.y; }
+  me.x = clamp(input.x, -PX, PX);
+  me.y = clamp(input.y, -PY, PY);
+  const v = paddleVel(); me.vx = v.x; me.vy = v.y;
+  // toque: para servir basta passar a raquete pela bola com um gesto
+  if (G.mode === 'serve' && G.toss && input.touch && input.down && Math.hypot(v.x, v.y) > 1.6 && sweepHit()) serve();
+  // a face mantém a inclinação do último gesto durante uma fração de segundo
+  const gk = Math.exp(-dt / 0.22);
+  if (Math.hypot(v.x, v.y) >= Math.hypot(me.gx, me.gy) * gk) { me.gx = v.x; me.gy = v.y; }
+  else { me.gx *= gk; me.gy *= gk; }
+
+  aiUpdate(dt);
+  const live = G.mode === 'play';
+  const tcMe = live && ball.vz < 0 && (!SQUASH || G.turn === 'me') ? ball.z / -ball.vz : Infinity;
+  const tcOp = !live ? Infinity : SQUASH ? (G.turn === 'op' && ball.vz < 0 ? (ball.z - SQZ) / -ball.vz : Infinity) : (ball.vz > 0 ? (TD - ball.z) / ball.vz : Infinity);
+  updateRig(rigMe, me.x, me.y, me.gx, me.gy, dt, tcMe);
+  updateRig(rigOp, op.x, op.y, op.vx, op.vy, dt, tcOp);
+  for (const f of flashes) f.t += dt;
+
+  if (G.mode === 'title') {
+    // demonstração no ecrã inicial
+    const n = Math.ceil(dt / SUBSTEP), h = dt / n;
+    if (ball.vz === 0) { ball.x = 0; ball.y = 0; ball.z = 0.4; ball.vz = 1.5; ball.vx = 0.5; ball.vy = -0.3; setCurve(1.2, 0.8); }
+    for (let i = 0; i < n; i++) {
+      physics(h);
+      if (ball.z < 0 && ball.vz < 0) { ball.z = -ball.z; ball.vz = 1.5; ball.vx = rnd(-0.8, 0.8); ball.vy = rnd(-0.6, 0.6); setCurve(rnd(-2.5, 2.5), rnd(-2, 2)); }
+      if (ball.z > TD && ball.vz > 0) { ball.z = 2 * TD - ball.z; ball.vz = -1.5; ball.vx = rnd(-0.8, 0.8); ball.vy = rnd(-0.6, 0.6); setCurve(rnd(-2.5, 2.5), rnd(-2, 2)); }
+    }
+  } else if (G.mode === 'serve' && G.server === 'op') {
+    // serviço do adversário: espera, lança a bola ao ar e bate-lhe no topo
+    const os = G.opServe;
+    ball.rot += 1.2 * dt;
+    if (os && !G.warp && Math.abs(TD - TD_TARGET) < 0.01) {
+      if (!os.toss) { os.t -= dt; if (os.t <= 0) { os.toss = true; os.vy = -1.55; } }
+      else {
+        os.vy += 3.2 * dt; ball.y += os.vy * dt;
+        if (os.vy >= -0.05) {          // no topo: serve
+          G.opServe = null;
+          const L = G.level, r = Math.random();
+          const pNet = NET ? Math.max(0.04, 0.1 - 0.005 * (L - 1)) : 0;
+          const pWhiff = Math.max(0.02, 0.06 - 0.003 * (L - 1));
+          if (r >= pNet && r < pNet + pWhiff) {
+            // falhou a bola: faz o gesto, a bola cai — ponto teu
+            swingRig(rigOp, 0, 0, 0.8, op.x, op.y);
+            sfx.whoosh(0.6, op.x / TX, 0.85, 1, 0, 0.9, 0.05);
+            ball.vx = 0; ball.vy = 0.4; ball.vz = -0.05; ball.cx = 0; ball.cy = 3.2;   // cai (o "efeito" faz de gravidade)
+            G.rally = 0;
+            serveFault();
+          } else {
+            ball.vx = 0; ball.vy = 0; G.oppAttack = false;
+            if (SQUASH) squashOppHit(true);
+            else {
+              ball.z = TD; ball.vz = 1;
+              G.forceNet = r < pNet;     // serviço à rede
+              oppHit(false, true);
+              G.forceNet = false;
+            }
+            G.mode = 'play'; G.rally = 0;
+          }
+        }
+      }
+    }
+  } else if (G.mode === 'serve') {
+    ball.rot += 1.2 * dt;   // a bola mantém-se imóvel à espera do serviço
+    if (G.toss) {
+      // bola lançada ao ar: sobe, para no topo e cai; se ninguém lhe bater, volta ao centro
+      G.toss.vy += 3.2 * dt;
+      ball.y += G.toss.vy * dt;
+      if (ball.y > 0.55) {
+        G.toss = null; ball.x = 0; ball.y = 0;
+        G.faults = (G.faults || 0) + 1;                          // bola falhada no serviço = falha
+        if (G.faults >= 2) { G.nextServer = 'op'; toServe(); }   // 2.ª falha seguida: serve o adversário
+      }
+      // durante o lançamento basta um gesto rápido através da bola (ou o clique)
+      else if (Math.hypot(me.vx, me.vy) > 1.6 && sweepHit()) serve();
+    }
+  } else if (G.mode === 'boom') {
+    updateBoomerang(dt);
+  } else if (G.mode === 'play' || G.mode === 'miss') {
+    const n = Math.ceil(dt / SUBSTEP), h = dt / n;
+    for (let i = 0; i < n; i++) {
+      const zPrev = ball.z;
+      physics(h);
+      if (G.mode === 'play' && netHitTest(zPrev)) {
+        // bola na rede: trava e cai; perde o ponto quem bateu
+        const mineShot = ball.vz > 0;
+        ball.z = TD / 2 - Math.sign(ball.vz) * 0.02; ball.vz = -Math.sign(ball.vz) * 0.25;
+        ball.vx *= 0.2; ball.vy = 0.5; ball.cx = ball.cy = 0; fire.k = 0;
+        sfx.net();
+        const sFault = G.rally === 0 && ((mineShot && G.server === 'me') || (!mineShot && G.server === 'op'));
+        if (sFault) serveFault(); else if (mineShot) missMe(); else missOpp();
+        continue;
+      }
+      if (G.mode === 'play' && SQUASH) {
+        // SQUASH: a parede do fundo devolve a bola; batem à vez
+        if (ball.vz > 0 && ball.z >= TD) { ball.z = 2 * TD - ball.z; ball.vz = -ball.vz; sfx.wall(Math.abs(ball.vz) * 0.7); }
+        else if (ball.vz < 0 && G.turn === 'op' && ball.z <= SQZ) {
+          if (hitTest(op)) squashOppHit(false);
+          else if (ball.z < SQZ - Math.max(0.06, -ball.vz * 0.06)) { G.turn = 'none'; missOpp(); }
+        }
+        else if (ball.vz < 0 && G.turn === 'me' && ball.z <= 0) {
+          const hp = sweepHit();
+          if (hp) playerHit(hp);
+          else if (ball.z < -Math.max(0.06, -ball.vz * 0.06)) missMe();
+        }
+        checkMatrixArm();
+      } else if (G.mode === 'play') {
+        if (ball.vz < 0 && ball.z <= 0) {
+          // pequena margem para um golpe ligeiramente atrasado (~60 ms)
+          const hp = sweepHit();
+          if (hp) playerHit(hp);
+          else if (ball.z < -Math.max(0.06, -ball.vz * 0.06)) missMe();
+        }
+        else if (ball.vz > 0 && ball.z >= TD) {
+          if (hitTest(op)) oppHit();
+          else {
+            // quase fora do alcance: às vezes estica-se e devolve uma bola fraca e central (oportunidade para atacares)
+            const ddx = (ball.x - op.x) / (PW + 0.17), ddy = (ball.y - op.y) / (PH + 0.14);
+            if (ddx * ddx + ddy * ddy <= 1 && Math.random() < Math.min(0.12 + 0.03 * G.level, 0.45)) oppHit(true);
+            else if (!tryBoomerang()) missOpp();
+          }
+        }
+        checkMatrixArm();
+      }
+    }
+    if (G.mode === 'miss') {
+      if (ball.z < -0.45 || ball.z > TD + 0.6) ball.visible = false;
+      G.timer -= dt;
+      if (G.timer <= 0) {
+        if (G.after === 'gameover') {
+          G.mode = 'gameover'; G.overAt = performance.now(); sfx.over();
+        } else if (G.after === 'level') {
+          G.level++; G.opp = 3; G.pm = 0; G.po = 0; G.levelLosses = 0;
+          // nível concluído: +1 bola (para prolongar o jogo)
+          if (G.lives < MAX_LIVES) { G.lives++; pop('NÍVEL CONCLUÍDO · +1 BOLA', '#7fd4ff'); setTimeout(() => sfx.extra(), 450); }
+          // novo comprimento de túnel, diferente do atual
+          TD_TARGET = newTunnel(TD_TARGET);
+          buildVerb(TD_TARGET);
+          ballHueTarget = newBallHue(ballHueTarget);
+          themePending = newTheme(themeIdx);
+          squashPending = G.level >= 3 && Math.random() < 0.2;
+          netPending = !squashPending && Math.random() < 0.3 ? { top: TY - rnd(0.36, 0.5) } : null;
+          visPending = newVis();
+          G.warp = { t: 0, dur: 2.3, A: 14 };      // viagem pelo túnel: as paredes correm em direção a ti
+          sfx.whoosh(1.3, 0, 0, 0.5, 0, 1.3, 0.9);
+          const tn = tunnelInfo(TD_TARGET);
+          banner('NÍVEL ' + G.level, '', 2.4, '#b6ff7a');
+          sfx.level();
+          toServe();
+        } else if (G.after === 'regame') {
+          G.pm = 0; G.po = 0;                       // novo jogo no mesmo nível
+          banner('NÍVEL ' + G.level, '', 1.4, '#ffb0a0');
+          toServe();
+        } else if (G.after === 'fault') {
+          if (G.faults >= 2) { G.nextServer = G.server === 'me' ? 'op' : 'me'; toServe(); }   // dupla falta: passa o serviço
+          else { G.nextServer = G.server; toServe(true); }                                     // repete o serviço
+        } else toServe();
+      }
+    }
+  }
+
+  updateFire(dt);
+  updateGlitch(dt);
+  if (ballHue !== ballHueTarget) {        // transição gradual da cor (pelo caminho mais curto no círculo)
+    let dh = ((ballHueTarget - ballHue + 540) % 360) - 180;
+    ballHue = (ballHue + dh * (1 - Math.exp(-dt * 2.2)) + 360) % 360;
+    if (Math.abs(dh) < 0.5) ballHue = ballHueTarget;
+  }
+  if (G.warp) {
+    // fase em número inteiro de anéis no fim → termina sem saltos
+    G.warp.t += dt;
+    const u = Math.min(1, G.warp.t / G.warp.dur);
+    G.warpPhase = G.warp.A * (1 - Math.cos(Math.PI * u)) / 2;
+    G.warpGlow = Math.sin(Math.PI * u);
+    if (u >= 0.5 && themePending !== null) { themeIdx = themePending; themePending = null; NET = netPending; netPending = undefined; SQUASH = squashPending; }
+    if (u >= 0.5 && visPending !== null) { visIdx = visPending; visPending = null; glitch.timer = rnd(15, 30); }   // troca de cenário no auge do clarão
+    if (u >= 1) { G.warp = null; G.warpPhase = 0; G.warpGlow = 0; }
+  }
+  // avisos correm em tempo real (não abrandam no tempo-bala)
+  const rdt = G.rdt !== undefined ? G.rdt : dt;
+  if (G.banner) { G.banner.t += rdt; if (G.banner.t > G.banner.dur) G.banner = null; }
+  for (const p of G.pops) p.t += rdt;
+  while (G.pops.length && G.pops[0].t > 1.6) G.pops.shift();
+}
+
+// --- Desenho --------------------------------------------------------------
+function poly(pts) {
+  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.closePath();
+}
+function rectAt(z) {
+  const a = P(-TX, -TY, z), b = P(TX, TY, z);
+  return { x: a.x, y: a.y, w: b.x - a.x, h: b.y - a.y };
+}
+
+// --- Cenários do túnel (mudam a cada nível, a meio da viagem) ---------------------------
+//   grid: grelha clássica · strips: arestas com faixas de luz · panels: paredes em xadrez
+//   stripes: faixas industriais alternadas · nodes: circuito com nós luminosos
+const THEMES = [
+  { name: 'CENÁRIO CLÁSSICO',   line: '100,165,215', edge: '130,190,235', wallA: '24,50,76', wallB: '28,58,86',  far: '#02060b', rings: 8,  lon: [-0.5, 0, 0.5], lonA: 0.13, ringA: 0.24, style: 'grid' },
+  { name: 'CENÁRIO NÉON',       line: '210,90,255',  edge: '235,150,255', wallA: '38,10,56', wallB: '50,14,70',  far: '#07020c', rings: 10, lon: [-0.5, 0, 0.5], lonA: 0.16, ringA: 0.3,  style: 'strips' },
+  { name: 'CENÁRIO XADREZ',     line: '70,215,195',  edge: '120,235,215', wallA: '6,36,36',  wallB: '8,44,42',   far: '#010807', rings: 8,  lon: [-0.5, 0, 0.5], lonA: 0.1,  ringA: 0.18, style: 'panels' },
+  { name: 'CENÁRIO INDUSTRIAL', line: '255,170,60',  edge: '255,195,110', wallA: '42,28,14', wallB: '52,34,16',  far: '#090603', rings: 12, lon: [0],            lonA: 0.1,  ringA: 0.22, style: 'stripes' },
+  { name: 'CENÁRIO CIRCUITO',   line: '60,255,150',  edge: '120,255,185', wallA: '3,26,14',  wallB: '5,32,18',   far: '#010603', rings: 6,  lon: [-0.66, -0.33, 0, 0.33, 0.66], lonA: 0.12, ringA: 0.18, style: 'nodes' },
+  { name: 'CENÁRIO GELO',       line: '190,235,255', edge: '225,245,255', wallA: '36,64,90', wallB: '46,78,104', far: '#06101a', rings: 12, lon: [-0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75], lonA: 0.09, ringA: 0.2, style: 'grid' },
+  { name: 'CENÁRIO SOLAR',      line: '255,215,90',  edge: '255,235,150', wallA: '48,32,6',  wallB: '58,40,8',   far: '#0a0700', rings: 8,  lon: [-0.5, 0.5],     lonA: 0.12, ringA: 0.26, style: 'strips' }
+];
+let themeIdx = 0, themePending = null;
+// rede de ténis ocasional a meio do túnel (presa ao chão): NET.top = altura (y) do topo da rede
+let NET = null, netPending;
+// modo squash (ocasional): os dois jogam do mesmo lado contra a parede do fundo, à vez
+let SQUASH = false, squashPending = false;
+const SQZ = 0.35;   // plano onde o adversário bate a bola no squash (um pouco à tua frente)
+function netHitTest(zPrev) {
+  if (!NET) return false;
+  const zm = TD / 2;
+  const crossed = (zPrev < zm && ball.z >= zm) || (zPrev > zm && ball.z <= zm);
+  return crossed && ball.y + BR * 0.6 > NET.top;
+}
+// visibilidade do túnel: 0 = reduzida (escuro, névoa, cortes de energia) · 1 = normal · 2 = boa
+const VIS = [
+  { wall: 0.45, line: 0.45, edge: 0.6, fog: 0.62, vign: 0.6, name: 'VISIBILIDADE REDUZIDA' },
+  { wall: 1,    line: 1,    edge: 1,   fog: 0,    vign: 0,   name: '' },
+  { wall: 1.45, line: 1.5,  edge: 1.2, fog: 0,    vign: 0,   name: 'BOA VISIBILIDADE' }
+];
+let visIdx = 1, visPending = null;
+function newVis() { const r = Math.random(); return r < 0.38 ? 0 : r < 0.7 ? 1 : 2; }
+const fogAt = z => 1 - VIS[visIdx].fog * clamp(z / TD, 0, 1);   // opacidade restante a essa profundidade
+function newTheme(prev) {
+  let i; do { i = Math.floor(Math.random() * THEMES.length); } while (i === prev);
+  return i;
+}
+// ponto numa parede: lado 0 = teto, 1 = direita, 2 = chão, 3 = esquerda; a ∈ [-1,1] ao longo da parede
+function wallPt(side, a, z) {
+  return side === 0 ? P(a * TX, -TY, z) : side === 1 ? P(TX, a * TY, z) : side === 2 ? P(a * TX, TY, z) : P(-TX, a * TY, z);
+}
+
+function drawTunnel() {
+  const T = THEMES[themeIdx];
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  const n = [P(-TX, -TY, 0), P(TX, -TY, 0), P(TX, TY, 0), P(-TX, TY, 0)];
+  const f = [P(-TX, -TY, TD), P(TX, -TY, TD), P(TX, TY, TD), P(-TX, TY, TD)];
+  const wv = G.warpGlow || 0, ph = G.warpPhase || 0, wfr = ph - Math.floor(ph), wint = Math.floor(ph);
+  const N = T.rings, V = VIS[visIdx];
+
+  // paredes com sombreamento em profundidade
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) % 4;
+    const mn = { x: (n[i].x + n[j].x) / 2, y: (n[i].y + n[j].y) / 2 };
+    const mf = { x: (f[i].x + f[j].x) / 2, y: (f[i].y + f[j].y) / 2 };
+    const g = ctx.createLinearGradient(mn.x, mn.y, mf.x, mf.y);
+    g.addColorStop(0, `rgba(${i % 2 ? T.wallB : T.wallA},${Math.min(1, 0.6 * V.wall)})`);
+    g.addColorStop(1, visIdx === 2 ? `rgba(${i % 2 ? T.wallB : T.wallA},0.55)` : 'rgba(3,6,10,0.95)');
+    ctx.fillStyle = g;
+    poly([n[i], n[j], f[j], f[i]]); ctx.fill();
+  }
+  ctx.fillStyle = T.far;
+  poly(f); ctx.fill();
+  if (visIdx === 2) { ctx.fillStyle = `rgba(${T.line},0.07)`; poly(f); ctx.fill(); }   // fundo iluminado
+
+  // posições dos anéis (deslocam-se em direção a ti durante a viagem entre níveis)
+  const ringZ = [];
+  for (let k = 0; k <= N + 1; k++) ringZ.push({ z: clamp((k - wfr) / N * TD, 0, TD), k });
+
+  // padrões das paredes
+  if (T.style === 'panels' || T.style === 'stripes') {
+    const lanes = T.style === 'panels' ? [-1, ...T.lon, 1] : [-1, 1];
+    for (let r = 0; r < ringZ.length - 1; r++) {
+      const z0 = ringZ[r].z, z1 = ringZ[r + 1].z;
+      if (z1 - z0 < 1e-4) continue;
+      const fade = 1 - z0 / TD;
+      for (let side = 0; side < 4; side++) {
+        for (let l = 0; l < lanes.length - 1; l++) {
+          if ((ringZ[r].k + wint + l + side) % 2) continue;
+          const A = wallPt(side, lanes[l], z0), B = wallPt(side, lanes[l + 1], z0),
+                C = wallPt(side, lanes[l + 1], z1), D = wallPt(side, lanes[l], z1);
+          ctx.fillStyle = `rgba(${T.line},${(T.style === 'panels' ? 0.09 : 0.11) * (0.4 + 0.6 * fade)})`;
+          poly([A, B, C, D]); ctx.fill();
+        }
+      }
+    }
+  }
+
+  // linhas longitudinais
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = `rgba(${T.line},${T.lonA * V.line})`;
+  ctx.beginPath();
+  for (const a of T.lon) for (let side = 0; side < 4; side++) {
+    const p0 = wallPt(side, a, 0), p1 = wallPt(side, a, TD);
+    ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y);
+  }
+  ctx.stroke();
+
+  // anéis de profundidade
+  for (const rz of ringZ) {
+    const zz = rz.z;
+    if (zz <= 0.002 || zz >= TD - 0.002) continue;
+    const r = rectAt(zz), kk = zz / TD * 8, near = 1 - zz / TD;
+    ctx.lineWidth = 1 + wv * 1.6 * near;
+    ctx.strokeStyle = `rgba(${T.line},${Math.max(0.03, T.ringA - kk * 0.018) * V.line * (visIdx === 0 ? 0.4 + 0.6 * near : 1) + wv * 0.45 * near})`;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+  }
+
+  // nós luminosos (cenário circuito)
+  if (T.style === 'nodes') {
+    const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 300);
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    for (const rz of ringZ) {
+      if (rz.z <= 0.002 || rz.z >= TD - 0.002) continue;
+      const fade = 1 - rz.z / TD;
+      for (let side = 0; side < 4; side++) for (const a of T.lon) {
+        if ((rz.k + wint + side + Math.round(a * 3)) % 3) continue;
+        const q = wallPt(side, a, rz.z), rr = Math.max(1.2, 3.2 * q.s);
+        ctx.fillStyle = `rgba(${T.line},${(0.35 + 0.5 * pulse) * fade})`;
+        ctx.beginPath(); ctx.arc(q.x, q.y, rr, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  if (wv > 0) {
+    // linhas de velocidade extra nas paredes durante a viagem
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = `rgba(${T.edge},${0.18 * wv})`;
+    ctx.beginPath();
+    for (const q of [-0.75, -0.25, 0.25, 0.75]) for (let side = 0; side < 4; side++) {
+      const p0 = wallPt(side, q, 0), p1 = wallPt(side, q, TD);
+      ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y);
+    }
+    ctx.stroke();
+  }
+
+  // arestas do túnel (faixas de luz nos cenários "strips")
+  ctx.save();
+  if (T.style === 'strips') { ctx.shadowColor = `rgba(${T.edge},0.9)`; ctx.shadowBlur = 10; ctx.lineWidth = 3; ctx.strokeStyle = `rgba(${T.edge},0.85)`; }
+  else { ctx.lineWidth = 1.4; ctx.strokeStyle = `rgba(${T.edge},${Math.min(1, 0.55 * V.edge)})`; }
+  ctx.beginPath();
+  for (let i = 0; i < 4; i++) { ctx.moveTo(n[i].x, n[i].y); ctx.lineTo(f[i].x, f[i].y); }
+  ctx.stroke();
+  ctx.restore();
+  ctx.lineWidth = 1.4;
+  const fr = rectAt(TD);
+  ctx.strokeStyle = `rgba(${T.edge},${Math.min(1, 0.6 * V.edge) * (visIdx === 0 ? 0.5 : 1)})`;
+  ctx.strokeRect(fr.x, fr.y, fr.w, fr.h);
+  const nr = rectAt(0);
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = `rgba(${T.edge},${Math.min(1, 0.75 * V.edge)})`;
+  ctx.strokeRect(nr.x + 1, nr.y + 1, nr.w - 2, nr.h - 2);
+  ctx.lineWidth = 1;
+}
+
+function drawDepthRing() {
+  if (!ball.visible || ball.z < 0 || ball.z > TD) return;
+  const r = rectAt(ball.z);
+  ctx.save();
+  ctx.strokeStyle = `hsla(${Math.round(ballHue)},100%,62%,0.95)`;
+  ctx.shadowColor = `hsla(${Math.round(ballHue)},100%,55%,0.9)`;
+  ctx.shadowBlur = 8;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(r.x, r.y, r.w, r.h);
+  ctx.restore();
+}
+
+// =========================================================================
+//  RAQUETES 3D ANIMADAS
+//  A orientação de cada raquete é uma mola amortecida (roll / yaw / pitch / avanço)
+//  que persegue um alvo calculado a partir de:
+//   · lado do ecrã → direita (forehand) ou esquerda (backhand), com viragem da raquete
+//   · posição → o braço "pivota" a partir do centro, inclinando a raquete nas zonas extremas
+//   · velocidade do gesto → a face inclina-se no sentido do movimento (escovadela)
+//   · bola a chegar → preparação (recua, abre a face) e batida para a frente
+//   · impacto → follow-through a cruzar o corpo e no sentido do gesto
+// =========================================================================
+const HEAD_N = 40, BLADE = 0.018, HANDLE_L = 0.17, HANDLE_W = 0.034;
+const PAL = {
+  me: { front: '60,140,255', back: '20,55,150', glow: '90,170,255', alpha: 0.30 },
+  op: { front: '255,70,70',  back: '150,25,30', glow: '255,90,90',  alpha: 0.45 }
+};
+function makeRig(mirror) {
+  return { mirror, side: 1, roll: mirror ? -0.5 : 0.5, yaw: 0, pitch: 0, z: 0,
+           vr: 0, vyaw: 0, vp: 0, vz: 0, ox: 0, oy: 0, vox: 0, voy: 0, hist: [], speed: 0 };
+}
+const rigMe = makeRig(false), rigOp = makeRig(true);
+const flashes = [];
+
+function spring(r, key, vkey, target, dt, k, c) {
+  r[vkey] += (k * (target - r[key]) - c * r[vkey]) * dt;
+  r[key] += r[vkey] * dt;
+}
+// ângulo da face (radianos): o gesto inclina-a no sentido do movimento e,
+// nas zonas extremas, o braço vira-a para o centro da mesa
+function faceAim(x, y, vx, vy) {
+  return {
+    ax: clamp(clamp(vx, -9, 9) * 0.17, -0.95, 0.95) - x * 0.22,
+    ay: clamp(clamp(vy, -9, 9) * 0.16, -0.85, 0.85) - y * 0.25
+  };
+}
+// =========================================================================
+//  GOLPES ANIMADOS
+//  Quando a bola se aproxima, a raquete escolhe o golpe conforme a SUA posição:
+//    em cima → SMASH (de cima para baixo) · em baixo → LIFT (de baixo para cima)
+//    à direita → DIREITA (varre para a esquerda) · à esquerda → ESQUERDA (varre para a direita)
+//  (um gesto vertical forte também pode impor o smash ou o lift)
+//  Fases: preparação (recua até à pose W) → batida a acelerar (passa pela posição real
+//  EXATAMENTE no contacto) → acompanhamento (pose F) → regresso.
+//  O golpe é só visual: a física usa sempre a posição controlada.
+// =========================================================================
+const STROKES = {
+  //          pose de preparação W                                      pose final F                                              arco
+  fore:  { W: { ox: 0.24, oy: 0.06, z: -0.15, yaw: 0.95, pitch: 0, roll: -0.55 },
+           F: { ox: -0.32, oy: -0.22, z: 0.32, yaw: -1.05, pitch: 0, roll: 0.95 }, bulge: [0, 0.12] },
+  back:  { W: { ox: -0.24, oy: 0.06, z: -0.15, yaw: -0.95, pitch: 0, roll: -0.55 },
+           F: { ox: 0.32, oy: -0.22, z: 0.32, yaw: 1.05, pitch: 0, roll: 0.95 }, bulge: [0, 0.12] },
+  smash: { W: { ox: 0.08, oy: -0.28, z: -0.13, yaw: 0, pitch: 0.95, roll: -0.25 },
+           F: { ox: -0.06, oy: 0.34, z: 0.36, yaw: 0, pitch: -1.0, roll: 0.35 }, bulge: [0.14, 0] },
+  lift:  { W: { ox: 0.06, oy: 0.26, z: -0.12, yaw: 0, pitch: -0.5, roll: -0.2 },
+           F: { ox: -0.05, oy: -0.32, z: 0.28, yaw: 0, pitch: 0.75, roll: 0.3 }, bulge: [0.14, 0] }
+};
+const T_START = 0.42, T_FWD = 0.17, T_FOLLOW = 0.2, T_RET = 0.35;
+const easeIO = u => u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+
+// golpe ditado pelo gesto (se for rápido o suficiente)
+function gestureStroke(r, vx, vy) {
+  const m = Math.hypot(vx, vy);
+  if (m < 3) return null;
+  if (Math.abs(vy) > Math.abs(vx) * 0.8) return vy > 0 ? 'smash' : 'lift';
+  const gx = r.mirror ? -vx : vx;
+  return gx < 0 ? 'fore' : 'back';     // para a esquerda = direita (varre para a esquerda) · para a direita = esquerda
+}
+function chooseStroke(r, x, y, vx, vy) {
+  const px = r.mirror ? -x : x;
+  let type = gestureStroke(r, vx, vy);
+  if (type) {}
+  else if (y < -0.2) type = 'smash'; else if (y > 0.22) type = 'lift';
+  else type = px >= 0 ? 'fore' : 'back';
+  const sx = px >= 0 ? 1 : -1;
+  // face que se vê: direita = face da frente, esquerda = face de trás
+  r.side = type === 'fore' ? 1 : type === 'back' ? -1 : sx;
+  r.st = { type, sx, sg: r.side, phase: 'wind', w: 0, s: -1, t: 0,
+           big: (r.smash > 0 || r.hard) ? 1.3 : 1, pf: 1 };
+}
+// deslocamento da pose em relação à raquete "de base" (posição real + orientação do gesto)
+function strokeDelta(r) {
+  const st = r.st;
+  if (!st) return null;
+  const S = STROKES[st.type], mf = r.mirror ? -1 : 1;
+  const sxm = (st.type === 'smash' || st.type === 'lift') ? st.sx : 1;
+  const pose = (P0, k) => ({
+    ox: P0.ox * sxm * mf * k, oy: P0.oy * k, z: P0.z * k,
+    yaw: P0.yaw * mf * k, pitch: P0.pitch * st.sg * mf * k, roll: -P0.roll * mf * k
+  });
+  const W = pose(S.W, st.big), F = pose(S.F, st.big * st.pf);
+  let d;
+  if (st.s <= 0) { const u = st.s + 1, e = u * u;           // batida: acelera até ao contacto
+    d = {}; for (const k in W) d[k] = W[k] * (1 - e);
+  } else { const u = st.s, e = 1 - (1 - u) * (1 - u);       // acompanhamento: desacelera
+    d = {}; for (const k in F) d[k] = F[k] * e;
+  }
+  const bw = Math.sin(Math.PI * (st.s + 1) / 2) * st.big;   // arco: a trajetória curva
+  d.ox += S.bulge[0] * sxm * mf * bw; d.oy += S.bulge[1] * bw;
+  for (const k in d) d[k] *= st.w;
+  return d;
+}
+function stepStroke(r, x, y, vx, vy, dt, tc) {
+  const st = r.st;
+  if (!st) {
+    if (tc < T_START && tc > 0.05) chooseStroke(r, x, y, vx, vy);
+    return;
+  }
+  if (st.phase === 'wind') {
+    st.w = Math.min(1, st.w + dt / 0.16); st.s = -1;
+    if (tc <= T_FWD) st.phase = 'fwd';
+    else if (!(tc < T_START + 0.2)) { st.phase = 'ret'; st.t = 0; }   // a bola já não vem
+  }
+  if (st.phase === 'fwd') {
+    st.w = Math.min(1, st.w + dt / 0.08);
+    if (isFinite(tc) && tc > 0) st.s = -Math.min(1, tc / T_FWD);
+    else { st.phase = 'follow'; st.t = 0; }                           // contacto (ou falhou)
+  }
+  if (st.phase === 'follow') {
+    st.t += dt; st.s = Math.min(1, st.t / T_FOLLOW);
+    if (st.t >= T_FOLLOW) { st.phase = 'ret'; st.t = 0; }
+  }
+  if (st.phase === 'ret') {
+    st.t += dt; st.s = 1; st.w = Math.min(st.w, 1 - easeIO(Math.min(1, st.t / T_RET)));
+    if (st.t >= T_RET) r.st = null;
+  }
+}
+
+// tc = tempo até a bola chegar a esta raquete (Infinity se não vier)
+function updateRig(r, x, y, vx, vy, dt, tc) {
+  if (dt <= 0) return;
+  r.lock = Math.max(0, (r.lock || 0) - dt);
+  r.smash = Math.max(0, (r.smash || 0) - dt);
+  stepStroke(r, x, y, vx, vy, dt, tc);
+  if (!r.st) {
+    // sem golpe em curso: o lado acompanha a posição (com histerese)
+    const sx = r.mirror ? -x : x;
+    if (r.lock === 0 && Math.hypot(vx, vy) < 2.2) {
+      if (r.side > 0 && sx < -0.18) r.side = -1;
+      else if (r.side < 0 && sx > 0.18) r.side = 1;
+    }
+  }
+  const fore = r.side > 0, sg = fore ? 1 : -1;
+  const aim = faceAim(x, y, vx, vy);
+  if (!r.mirror && input.touch) aim.ay += y * 0.25;   // tátil: sem inclinação pela altura (a ponta da pega fica sob o dedo)
+  const yawT   = (fore ? 0 : Math.PI) + aim.ax;
+  const pitchT = -sg * aim.ay;
+  // no ecrã tátil a pega aponta a direito para baixo: a ponta fica sempre sob o dedo
+  // a pega aponta sempre para o centro (o "corpo") e a cabeça para fora:
+  //  · em cima: pega para baixo · em baixo: pega quase deitada para o centro (sem rodar por completo)
+  //  · no ecrã tátil (a tua raquete) a pega fica sempre a direito para baixo, para o dedo ficar na ponta
+  const fb = clamp((y - 0.12) / 0.4, 0, 1), fbs = fb * fb * (3 - 2 * fb);          // transição suave na parte de baixo
+  // em baixo a raquete baixa e a pega deita-se para o centro (até ~70°), sem dar a volta — como um braço real
+  const mag = 0.5 * (1 - y * 0.35) * (1 - fbs) + 1.2 * fbs;
+  const rollT  = (!r.mirror && input.touch) ? 0 : (r.mirror ? -1 : 1) * mag + sg * clamp(clamp(vx, -9, 9) * 0.05, -0.35, 0.35);
+  const n = Math.max(1, Math.ceil(dt / 0.004)), h = dt / n;
+  for (let i = 0; i < n; i++) {
+    spring(r, 'yaw', 'vyaw', yawT, h, 190, 20);
+    spring(r, 'pitch', 'vp', pitchT, h, 190, 20);
+    spring(r, 'roll', 'vr', rollT, h, 150, 18);
+    spring(r, 'z', 'vz', 0, h, 260, 22);
+  }
+  r.speed += (Math.hypot(vx, vy) - r.speed) * Math.min(1, dt * 20);
+}
+// contacto: passa ao acompanhamento, com amplitude conforme a força da pancada
+function swingRig(r, vx, vy, power, x, y) {
+  r.lock = 0.4; r.hard = false;
+  if (!r.st) {   // serviço ou golpe sem preparação: escolhe já o golpe e faz só o acompanhamento
+    chooseStroke(r, x !== undefined ? x : 0, y !== undefined ? y : 0, vx, vy);
+    r.st.w = 1;
+  }
+  // no contacto, o acompanhamento segue o gesto que fizeste de facto
+  const gt = gestureStroke(r, vx, vy);
+  if (gt) { r.st.type = gt; r.st.sx = (r.mirror ? -vx : vx) >= 0 ? 1 : -1; }
+  r.st.phase = 'follow'; r.st.t = 0; r.st.s = 0; r.st.w = 1;
+  r.st.pf = 0.85 + 0.55 * clamp(power, 0, 1.5);
+}
+function addFlash(x, y, z, rgb, size = 1, life = 0.22) { flashes.push({ x, y, z, rgb, t: 0, size, life }); }
+
+// orientação: roll (rotação no plano da face) → pitch → yaw
+function rot(st, u, v, w) {
+  let c = Math.cos(st.roll), s = Math.sin(st.roll);
+  const x1 = u * c - v * s, y1 = u * s + v * c, z1 = w;
+  c = Math.cos(st.pitch); s = Math.sin(st.pitch);
+  const y2 = y1 * c - z1 * s, z2 = y1 * s + z1 * c, x2 = x1;
+  c = Math.cos(st.yaw); s = Math.sin(st.yaw);
+  return { x: x2 * c + z2 * s, y: y2, z: -x2 * s + z2 * c };
+}
+function WP(st, u, v, w) {
+  const r = rot(st, u, v, w);
+  return P(st.x + r.x, st.y + r.y, st.z + r.z);
+}
+function pathPts(pts) {
+  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.closePath();
+}
+
+function drawRacket(st, pal, am, ghost) {
+  const camZ = -CAM;
+  const toCam = (wx, wy, wz) => ({ x: wx, y: wy, z: wz - camZ });
+  const nF = rot(st, 0, 0, -1);
+  const d0 = toCam(st.x, st.y, st.z);
+  const frontVisible = nF.x * d0.x + nF.y * d0.y + nF.z * d0.z < 0;
+  const wNear = frontVisible ? -BLADE / 2 : BLADE / 2;
+  const wFar = -wNear;
+  const facing = Math.abs(nF.x * d0.x + nF.y * d0.y + nF.z * d0.z) / Math.hypot(d0.x, d0.y, d0.z);
+  const rgb = frontVisible ? pal.front : pal.back;
+  const unit = P(st.x, st.y, st.z).s * K;
+
+  ctx.save();
+  ctx.lineJoin = 'round';
+
+  // pega futurista: corpo em grafite, linha de energia néon, anéis de grip e ponta luminosa
+  const hw = HANDLE_W, h0 = PH * 0.9, hEnd = PH + (pal === PAL.me && input.touch ? HANDLE_L_TOUCH : HANDLE_L);
+  const handle = [
+    [-hw * 0.55, h0], [hw * 0.55, h0], [hw * 0.8, PH + 0.03], [hw, PH + 0.06],
+    [hw * 1.05, hEnd - 0.03], [hw * 1.3, hEnd - 0.01], [hw * 1.2, hEnd + 0.012], [-hw * 1.2, hEnd + 0.012],
+    [-hw * 1.3, hEnd - 0.01], [-hw * 1.05, hEnd - 0.03], [-hw, PH + 0.06], [-hw * 0.8, PH + 0.03]
+  ].map(([u, v]) => WP(st, u, v, 0));
+  const glowA = (ghost ? 0.6 : 1) * am;
+  if (!ghost) {
+    // corpo: grafite com reflexo metálico lateral
+    const L = WP(st, -hw * 1.1, (h0 + hEnd) / 2, 0), R = WP(st, hw * 1.1, (h0 + hEnd) / 2, 0);
+    const g = ctx.createLinearGradient(L.x, L.y, R.x, R.y);
+    g.addColorStop(0, `rgba(14,18,26,${am})`);
+    g.addColorStop(0.3, `rgba(70,84,104,${am})`);
+    g.addColorStop(0.45, `rgba(150,165,185,${am})`);
+    g.addColorStop(0.6, `rgba(48,58,74,${am})`);
+    g.addColorStop(1, `rgba(10,13,20,${am})`);
+    ctx.fillStyle = g;
+    pathPts(handle); ctx.fill();
+  }
+  ctx.strokeStyle = `rgba(${pal.glow},${0.55 * glowA})`;
+  ctx.lineWidth = Math.max(1, unit * 0.004);
+  pathPts(handle); ctx.stroke();
+  if (!ghost) {
+    ctx.save();
+    ctx.shadowColor = `rgba(${pal.glow},0.95)`; ctx.shadowBlur = 8;
+    // linha de energia ao longo da pega
+    let a = WP(st, 0, PH + 0.035, -0.001), b = WP(st, 0, hEnd - 0.025, -0.001);
+    ctx.strokeStyle = `rgba(${pal.glow},${0.95 * am})`;
+    ctx.lineWidth = Math.max(1.2, unit * 0.007);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    // anéis de grip
+    ctx.lineWidth = Math.max(1, unit * 0.005);
+    ctx.strokeStyle = `rgba(${pal.glow},${0.6 * am})`;
+    ctx.beginPath();
+    for (let k = 0; k < 4; k++) {
+      const v = PH + 0.07 + k * 0.025, ww = hw * (1 + k * 0.02);
+      a = WP(st, -ww, v, 0); b = WP(st, ww, v, 0);
+      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    }
+    ctx.stroke();
+    // anel de ligação à cabeça
+    ctx.lineWidth = Math.max(1.4, unit * 0.008);
+    ctx.strokeStyle = `rgba(230,245,255,${0.85 * am})`;
+    a = WP(st, -hw * 0.85, PH + 0.03, 0); b = WP(st, hw * 0.85, PH + 0.03, 0);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    // ponta: núcleo de energia que pulsa
+    const c = WP(st, 0, hEnd + 0.002, 0);
+    const pr = Math.max(2, unit * 0.022) * (1 + 0.15 * Math.sin(performance.now() / 180));
+    const gg = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, pr * 2.2);
+    gg.addColorStop(0, `rgba(255,255,255,${am})`);
+    gg.addColorStop(0.35, `rgba(${pal.glow},${0.9 * am})`);
+    gg.addColorStop(1, `rgba(${pal.glow},0)`);
+    ctx.fillStyle = gg;
+    ctx.beginPath(); ctx.arc(c.x, c.y, pr * 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // contorno da cabeça (oval) nas duas faces
+  const near = [], far = [];
+  for (let i = 0; i < HEAD_N; i++) {
+    const th = i / HEAD_N * Math.PI * 2, u = Math.cos(th) * PW, v = Math.sin(th) * PH;
+    near.push(WP(st, u, v, wNear));
+    far.push(WP(st, u, v, wFar));
+  }
+
+  // espessura do aro (metal escuro): só as faces laterais viradas para a câmara
+  if (!ghost) {
+    ctx.fillStyle = `rgba(38,48,64,${0.95 * am})`;
+    for (let i = 0; i < HEAD_N; i++) {
+      const j = (i + 1) % HEAD_N, th = (i + 0.5) / HEAD_N * Math.PI * 2;
+      const nl = rot(st, Math.cos(th) / PW, Math.sin(th) / PH, 0);
+      const pr = rot(st, Math.cos(th) * PW, Math.sin(th) * PH, 0);
+      const dc = toCam(st.x + pr.x, st.y + pr.y, st.z + pr.z);
+      if (nl.x * dc.x + nl.y * dc.y + nl.z * dc.z >= 0) continue;
+      ctx.beginPath();
+      ctx.moveTo(near[i].x, near[i].y); ctx.lineTo(near[j].x, near[j].y);
+      ctx.lineTo(far[j].x, far[j].y); ctx.lineTo(far[i].x, far[i].y);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  // borracha (translúcida para se ver a bola) com brilho conforme o ângulo
+  const shade = 0.55 + 0.45 * facing;
+  if (!ghost) {
+    let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+    for (const p of near) { if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x; if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
+    const g = ctx.createLinearGradient(minX, minY, maxX, maxY);
+    g.addColorStop(0, `rgba(${rgb},${(pal.alpha + 0.12) * shade * am})`);
+    g.addColorStop(1, `rgba(${rgb},${(pal.alpha - 0.08) * shade * am})`);
+    ctx.fillStyle = g;
+    pathPts(near); ctx.fill();
+  }
+  ctx.shadowColor = `rgba(${pal.glow},0.8)`;
+  ctx.shadowBlur = ghost ? 0 : (pal === PAL.me ? 10 : 5);
+  ctx.strokeStyle = ghost ? `rgba(${pal.glow},${am})` : `rgba(${rgb},${0.95 * am})`;
+  ctx.lineWidth = Math.max(1.4, unit * (ghost ? 0.006 : 0.012));
+  pathPts(near); ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  if (!ghost) {
+    // aro interior metálico (fino) com reflexo
+    ctx.strokeStyle = `rgba(200,220,240,${0.45 * am})`;
+    ctx.lineWidth = Math.max(1, unit * 0.004);
+    pathPts(near); ctx.stroke();
+    // linhas de mira e zona central (acompanham a inclinação da face)
+    ctx.strokeStyle = `rgba(255,255,255,${0.22 * am})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    let a = WP(st, -PW, 0, wNear), b = WP(st, PW, 0, wNear);
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    a = WP(st, 0, -PH, wNear); b = WP(st, 0, PH, wNear);
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    const spot = [];
+    for (let i = 0; i < 20; i++) { const th = i / 20 * Math.PI * 2; spot.push(WP(st, Math.cos(th) * PW * 0.2, Math.sin(th) * PH * 0.2, wNear)); }
+    ctx.strokeStyle = `rgba(255,255,255,${0.35 * am})`;
+    pathPts(spot); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawRacketRig(r, x, y, z, pal, clipZ) {
+  const d = strokeDelta(r) || { ox: 0, oy: 0, z: 0, yaw: 0, pitch: 0, roll: 0 };
+  const zs = r.mirror ? -1 : 1;    // o adversário avança para o lado contrário
+  // o golpe pode levar a raquete às margens, mas não para fora do ecrã
+  const st = { x: clamp(x + d.ox, -0.86, 0.86), y: clamp(y + d.oy, -0.64, 0.64), z: z + d.z * zs,
+               roll: r.roll + d.roll, yaw: r.yaw + d.yaw, pitch: r.pitch + d.pitch };
+  r.hist.push(st);
+  if (r.hist.length > 10) r.hist.shift();
+  ctx.save();
+  if (clipZ !== undefined) { const cr = rectAt(clipZ); ctx.beginPath(); ctx.rect(cr.x, cr.y, cr.w, cr.h); ctx.clip(); }
+  // rasto de movimento quando o gesto é rápido
+  const sp = clamp((r.speed - 1.2) / 5, 0, 1);
+  if (sp > 0) {
+    for (const [k, a] of [[6, 0.15], [4, 0.25], [2, 0.4]]) {
+      const h = r.hist[r.hist.length - 1 - k];
+      if (h) drawRacket(h, pal, a * sp, true);
+    }
+  }
+  drawRacket(st, pal, 1, false);
+  ctx.restore();
+}
+
+function drawFlashes(dt) {
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i];
+    const t = f.t / (f.life || 0.22);
+    if (t >= 1) { flashes.splice(i, 1); continue; }
+    const p = P(f.x, f.y, f.z), r = (BR + t * 0.13 * (f.size || 1)) * p.s * K;
+    ctx.save();
+    ctx.strokeStyle = `rgba(${f.rgb},${(1 - t) * 0.9})`;
+    ctx.shadowColor = `rgba(${f.rgb},0.9)`; ctx.shadowBlur = 10;
+    ctx.lineWidth = Math.max(1, 3 * (f.size || 1) * (1 - t));
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, r, r * 0.92, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// --- Quebras de luz ocasionais (curto-circuito) ---------------------------------
+const glitch = { on: false, t: 0, segs: [], dur: 0, timer: 25, sparks: [], ex: 0, ey: 0, lastDark: 0 };
+function startGlitch() {
+  const segs = [];
+  const n = 4 + Math.floor(Math.random() * 4);
+  for (let i = 0; i < n; i++) {
+    segs.push({ d: rnd(0.04, i === n - 2 ? 0.28 : 0.12), dark: rnd(0.55, 0.9) });
+    segs.push({ d: rnd(0.03, 0.09), dark: rnd(0, 0.25) });
+  }
+  glitch.segs = segs; glitch.dur = segs.reduce((a, s2) => a + s2.d, 0);
+  glitch.on = true; glitch.t = 0;
+  // ponto da avaria: um sítio ao acaso na moldura do túnel
+  const side = Math.floor(Math.random() * 4), u = rnd(-0.8, 0.8);
+  glitch.ex = side === 0 ? -TX : side === 1 ? TX : u * TX;
+  glitch.ey = side === 2 ? -TY : side === 3 ? TY : u * TY;
+  glitch.ez = rnd(0, TD * 0.25);
+  sfx.shortCircuit(segs);
+}
+function glitchDark() {
+  if (!glitch.on) return 0;
+  let t = glitch.t;
+  for (const sg of glitch.segs) { if (t < sg.d) return sg.dark; t -= sg.d; }
+  return 0;
+}
+function updateGlitch(dt) {
+  if (!glitch.on) {
+    if ((G.mode !== 'play' && G.mode !== 'serve') || visIdx !== 0) return;   // só em túneis com má visibilidade
+    glitch.timer -= dt;
+    // só quando é justo: bola a afastar-se de ti (ainda longe do adversário) ou durante o serviço
+    if (glitch.timer <= 0 && !G.warp) startGlitch();          // pode acontecer a qualquer momento
+  } else {
+    glitch.t += dt;
+    if (glitch.t >= glitch.dur) { glitch.on = false; glitch.timer = rnd(30, 70); }
+  }
+  // faíscas: rebentam sempre que a luz falha
+  const d = glitchDark();
+  if (glitch.on && d > 0.3 && glitch.lastDark <= 0.3) {
+    for (let i = 0; i < 26; i++) glitch.sparks.push({ x: glitch.ex, y: glitch.ey, z: glitch.ez,
+      vx: rnd(-1.2, 1.2) - glitch.ex * 0.6, vy: rnd(-1.4, 0.4) - glitch.ey * 0.4, vz: rnd(-0.4, 0.4), t: 0, life: rnd(0.25, 0.6) });
+  }
+  glitch.lastDark = d;
+  for (let i = glitch.sparks.length - 1; i >= 0; i--) {
+    const sp = glitch.sparks[i];
+    sp.t += dt; sp.x += sp.vx * dt; sp.y += sp.vy * dt; sp.z += sp.vz * dt; sp.vy += 3 * dt;
+    if (sp.t > sp.life) glitch.sparks.splice(i, 1);
+  }
+}
+function drawGlitchSparks() {
+  if (!glitch.sparks.length) return;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const sp of glitch.sparks) {
+    const pp = P(sp.x, sp.y, sp.z), a = 1 - sp.t / sp.life;
+    const q = P(sp.x - sp.vx * 0.06, sp.y - sp.vy * 0.06, sp.z - sp.vz * 0.06);
+    ctx.strokeStyle = `rgba(255,${Math.round(220 + 35 * a)},${Math.round(140 + 100 * a)},${a})`;
+    ctx.lineWidth = Math.max(1.2, 3.2 * pp.s * a);
+    ctx.beginPath(); ctx.moveTo(q.x, q.y); ctx.lineTo(pp.x, pp.y); ctx.stroke();
+  }
+  // clarão elétrico no ponto da avaria enquanto a luz falha
+  if (glitch.on && glitchDark() > 0.3) {
+    const c = P(glitch.ex, glitch.ey, glitch.ez), r = 0.09 * c.s * K * rnd(0.7, 1.3);
+    const g = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, r);
+    g.addColorStop(0, 'rgba(255,255,255,0.9)'); g.addColorStop(0.3, 'rgba(160,210,255,0.6)'); g.addColorStop(1, 'rgba(120,180,255,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(c.x, c.y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// --- Tempo-bala (efeito "Matrix") ----------------------------------------------
+// De vez em quando, depois de uma raquetada forte, a bola fica suspensa no ar uns instantes
+// (tempo quase parado, chuva de código, câmara a rodar) e depois explode em velocidade.
+const MX = { arm: null, on: false, phase: '', t: 0, m: 0, scale: 1, cool: 0, rain: [], ripples: 0, used: false };
+const MX_CHARS = '01アイウエオカキクケコサシスセソタチツテトナニヌネノ$#*+<>=';
+function matrixArm(who, chance) {
+  if (MX.on || MX.arm || MX.used || MX.cool > 0 || G.warp || Math.random() > chance) return;
+  MX.arm = who;
+}
+function startMatrix() {
+  MX.arm = null; MX.on = true; MX.phase = 'slow'; MX.t = 0; MX.used = true;
+  // movimento de câmara diferente em cada tempo-bala
+  const types = ['roll', 'orbit', 'dolly', 'pull', 'tilt'];
+  let ty; do { ty = types[Math.floor(Math.random() * types.length)]; } while (ty === MX.lastCam && Math.random() < 0.85);
+  MX.lastCam = ty;
+  MX.cam = { type: ty, dir: Math.random() < 0.5 ? -1 : 1, amp: rnd(0.6, 1.2), f: rnd(0.8, 1.8), ph: rnd(0, 6.28) };
+  MX.rain = [];
+  const cols = Math.ceil(W / 16);
+  for (let i = 0; i < cols; i++) MX.rain.push({ x: i * 16 + 8, y: rnd(-H, 0), v: rnd(140, 420), n: Math.floor(rnd(6, 18)), seed: Math.random() * 1000 });
+  sfx.matrixIn();
+
+}
+function updateMatrix(dt) {
+  MX.cool = Math.max(0, MX.cool - dt);
+  if (!MX.on) { MX.scale = 1; MX.m = Math.max(0, MX.m - dt * 3); return; }
+  MX.t += dt;
+  for (const c of MX.rain) { c.y += c.v * dt; if (c.y - c.n * 16 > H) c.y = rnd(-120, 0); }
+  if (MX.phase === 'slow') {
+    const u = Math.min(1, MX.t / 0.4);
+    MX.scale = 1 - 0.985 * easeIO(u); MX.m = u;
+    if (u >= 1) { MX.phase = 'hold'; MX.t = 0; }
+  } else if (MX.phase === 'hold') {
+    MX.scale = 0.012; MX.m = 1;
+    if (MX.t >= 1.2) {
+      // explosão!
+      MX.phase = 'after'; MX.t = 0; MX.scale = 1;
+      ball.vz *= 1.55; ball.vx *= 1.2; ball.vy *= 1.2;
+      ignite(1, ball.vz > 0 ? '120,255,150' : '255,80,60');
+      G.shake = 0.5;
+      addFlash(ball.x, ball.y, clamp(ball.z, 0, TD), '170,255,190', 5, 0.5);
+      sfx.matrixOut();
+      if (ball.vz > 0) { addScore(300); pop('BALA MATRIX +300', '#8dff9a'); }
+    }
+  } else if (MX.phase === 'after') {
+    MX.m = Math.max(0, 1 - MX.t / 0.35);
+    if (MX.t >= 0.35) { MX.on = false; MX.cool = 15; }
+  }
+}
+function checkMatrixArm() {
+  if (!MX.arm || G.mode !== 'play') return;
+  if (MX.arm === 'me' && ball.vz > 0 && ball.z > TD * 0.32) startMatrix();
+  else if (MX.arm === 'op' && ball.vz < 0 && ball.z < TD * 0.62) startMatrix();
+}
+function drawMatrix() {
+  const m = MX.m;
+  if (m <= 0.01) return;
+  // tom verde
+  ctx.fillStyle = `rgba(0,35,10,${0.38 * m})`; ctx.fillRect(0, 0, W, H);
+  // ondas de choque à volta da bola suspensa
+  if (MX.on && ball.visible && ball.z >= 0) {
+    const pp = P(ball.x, ball.y, ball.z), r0 = BR * pp.s * K;
+    const tt = performance.now() / 1000;
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    for (let k = 0; k < 3; k++) {
+      const ph = ((tt * 1.4 + k / 3) % 1);
+      ctx.strokeStyle = `rgba(140,255,170,${(1 - ph) * 0.6 * m})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.ellipse(pp.x, pp.y, r0 * (1.5 + ph * 5), r0 * (1.5 + ph * 5) * 0.9, 0, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // chuva de código
+  ctx.save();
+  ctx.font = 'bold 14px "Courier New", monospace'; ctx.textAlign = 'center';
+  const tick = Math.floor(performance.now() / 90);
+  for (const c of MX.rain) {
+    for (let i = 0; i < c.n; i++) {
+      const y = c.y - i * 16;
+      if (y < -16 || y > H + 16) continue;
+      const ch = MX_CHARS[Math.floor((c.seed + i * 7 + tick * (i === 0 ? 1 : 0.2)) % MX_CHARS.length)];
+      const a = (i === 0 ? 0.9 : 0.55 * (1 - i / c.n)) * m * 0.75;
+      ctx.fillStyle = i === 0 ? `rgba(220,255,225,${a})` : `rgba(60,255,110,${a})`;
+      ctx.fillText(ch, c.x, y);
+    }
+  }
+  ctx.restore();
+}
+
+// --- Bola incandescente (remates e ataques fortes): rasto luminoso + faíscas ---
+const fire = { k: 0, rgb: '255,200,90', trail: [], sparks: [] };
+function ignite(k, rgb) { fire.k = k; fire.rgb = rgb; fire.trail.length = 0; }
+function updateFire(dt) {
+  if (G.mode === 'boom' && fire.k < 0.35) { fire.k = 0.35; fire.rgb = '200,225,255'; }   // rasto do bumerangue
+  const active = fire.k > 0 && ball.visible && (G.mode === 'play' || G.mode === 'miss' || G.mode === 'boom');
+  if (active) {
+    fire.trail.push({ x: ball.x, y: ball.y, z: ball.z });
+    if (fire.trail.length > 24) fire.trail.shift();
+    const n = Math.random() < fire.k * 0.55 ? (fire.k > 0.8 && Math.random() < 0.4 ? 2 : 1) : 0;
+    for (let i = 0; i < n; i++) fire.sparks.push({
+      x: ball.x, y: ball.y, z: ball.z,
+      vx: rnd(-0.7, 0.7) + ball.vx * 0.2, vy: rnd(-0.7, 0.4) + ball.vy * 0.2, vz: ball.vz * rnd(0.05, 0.35),
+      t: 0, life: rnd(0.25, 0.55)
+    });
+  } else if (fire.trail.length) fire.trail.splice(0, 2);
+  for (let i = fire.sparks.length - 1; i >= 0; i--) {
+    const sp = fire.sparks[i];
+    sp.t += dt; sp.x += sp.vx * dt; sp.y += sp.vy * dt; sp.z += sp.vz * dt; sp.vy += 1.4 * dt;
+    if (sp.t > sp.life) fire.sparks.splice(i, 1);
+  }
+  if (fire.sparks.length > 160) fire.sparks.splice(0, fire.sparks.length - 160);
+  G.shake = Math.max(0, (G.shake || 0) - dt * 1.8);
+}
+function drawFire() {
+  if (!fire.trail.length && !fire.sparks.length) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  const n = fire.trail.length, k = Math.max(fire.k, 0.35);
+  for (let i = 0; i < n; i++) {
+    const q = fire.trail[i];
+    if (q.z < -0.35) continue;
+    const pp = P(q.x, q.y, q.z), f = (i + 1) / n;
+    const r = BR * pp.s * K * (0.28 + 0.65 * f) * (1 + k * 0.32);
+    const g = ctx.createRadialGradient(pp.x, pp.y, 0, pp.x, pp.y, r * 1.9);
+    g.addColorStop(0, `rgba(255,255,235,${0.32 * f * k})`);
+    g.addColorStop(0.35, `rgba(${fire.rgb},${0.23 * f * k})`);
+    g.addColorStop(1, `rgba(${fire.rgb},0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(pp.x, pp.y, r * 1.9, 0, Math.PI * 2); ctx.fill();
+  }
+  for (const sp of fire.sparks) {
+    if (sp.z < -0.35) continue;
+    const pp = P(sp.x, sp.y, sp.z), a = 1 - sp.t / sp.life;
+    ctx.fillStyle = `rgba(255,${Math.round(200 + 55 * a)},${Math.round(120 + 100 * a)},${a * 0.8})`;
+    ctx.beginPath(); ctx.arc(pp.x, pp.y, Math.max(0.7, 1.9 * pp.s * a), 0, Math.PI * 2); ctx.fill();
+  }
+  // halo pulsante em volta da bola
+  if (fire.k > 0 && ball.visible && ball.z > -0.35) {
+    const pp = P(ball.x, ball.y, ball.z), r = BR * pp.s * K;
+    const pulse = 1 + 0.1 * Math.sin(performance.now() / 45);
+    const g = ctx.createRadialGradient(pp.x, pp.y, r * 0.55, pp.x, pp.y, r * 2.5 * pulse);
+    g.addColorStop(0, `rgba(255,250,220,${0.4 * fire.k})`);
+    g.addColorStop(0.42, `rgba(${fire.rgb},${0.25 * fire.k})`);
+    g.addColorStop(1, `rgba(${fire.rgb},0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(pp.x, pp.y, r * 2.5 * pulse, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// bola em brasa durante um remate
+function drawBallHeat() {
+  if (fire.k <= 0 || !ball.visible || ball.z < -0.35) return;
+  const pp = P(ball.x, ball.y, ball.z), r = BR * pp.s * K;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(pp.x, pp.y, 0, pp.x, pp.y, r * 1.1);
+  g.addColorStop(0, `rgba(255,255,240,${0.6 * fire.k})`);
+  g.addColorStop(1, `rgba(${fire.rgb},${0.28 * fire.k})`);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(pp.x, pp.y, r * 1.1, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+// rede: malha translúcida com fita branca no topo e postes nos lados
+function drawNet() {
+  if (!NET) return;
+  const zm = TD / 2, top = NET.top;
+  const a = P(-TX, top, zm), b = P(TX, TY, zm);
+  ctx.save();
+  ctx.globalAlpha = fogAt(zm);
+  ctx.fillStyle = 'rgba(20,30,40,0.25)';
+  ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
+  ctx.strokeStyle = 'rgba(220,235,245,0.28)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  const step = 0.05;
+  for (let x = -TX; x <= TX + 1e-6; x += step) { const p1 = P(x, top, zm), p2 = P(x, TY, zm); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); }
+  for (let y = top; y <= TY + 1e-6; y += step) { const p1 = P(-TX, y, zm), p2 = P(TX, y, zm); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); }
+  ctx.stroke();
+  // fita do topo
+  ctx.strokeStyle = 'rgba(250,252,255,0.95)'; ctx.lineWidth = Math.max(2, 0.025 * P(0, 0, zm).s * K);
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, a.y); ctx.stroke();
+  // postes
+  ctx.strokeStyle = 'rgba(180,190,200,0.9)'; ctx.lineWidth = Math.max(2, 0.03 * P(0, 0, zm).s * K);
+  ctx.beginPath(); ctx.moveTo(a.x, a.y - 2); ctx.lineTo(a.x, b.y); ctx.moveTo(b.x, a.y - 2); ctx.lineTo(b.x, b.y); ctx.stroke();
+  ctx.restore();
+}
+
+function drawBall() {
+  if (!ball.visible) return;
+  const p = P(ball.x, ball.y, ball.z);
+  const r = BR * p.s * K;
+  if (r < 0.5) return;
+  const depth = clamp(ball.z / TD, 0, 1);
+  ctx.save();
+  ctx.globalAlpha = (G.mode === 'boom' ? 1 : ball.z > TD ? clamp(1 - (ball.z - TD) / 0.6, 0, 1) : 1) * fogAt(Math.min(ball.z, TD));
+  const h = Math.round(ballHue);
+  ctx.shadowColor = `hsla(${h},100%,65%,0.8)`;
+  ctx.shadowBlur = r * 0.9;
+  const g = ctx.createRadialGradient(p.x - r * 0.35, p.y - r * 0.4, r * 0.08, p.x, p.y, r);
+  g.addColorStop(0, `hsl(${h},40%,${Math.round(98 - depth * 22)}%)`);
+  g.addColorStop(0.35, `hsl(${h},100%,${Math.round(82 - depth * 16)}%)`);
+  g.addColorStop(0.8, `hsl(${h},75%,${Math.round(48 - depth * 12)}%)`);
+  g.addColorStop(1, `hsl(${h},75%,${Math.round(22 - depth * 6)}%)`);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // costura que roda — mostra visualmente o efeito aplicado
+  if (r > 3) {
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.clip();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(Math.atan2(ball.cy, ball.cx || 1e-6));
+    ctx.strokeStyle = `hsla(${h},75%,20%,0.55)`;
+    ctx.lineWidth = Math.max(1, r * 0.09);
+    for (let k = 0; k < 2; k++) {
+      const ph = ball.rot + k * Math.PI;
+      const s = Math.sin(ph);
+      if (s <= 0) continue;
+      ctx.beginPath();
+      ctx.ellipse(r * Math.cos(ph) * 0.92, 0, Math.max(0.5, r * 0.35 * s), r * 0.98, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function txt(s, x, y, size, color, align = 'center', glow = 0, weight = 'bold') {
+  ctx.font = `${weight} ${size}px "Courier New", Courier, monospace`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.fillStyle = color;
+  ctx.fillText(s, x, y);
+  ctx.shadowBlur = 0;
+}
+
+function drawLives(n, max, x, y, dir, rgb) {
+  const r = Math.max(4, W * 0.011);
+  for (let i = 0; i < max; i++) {
+    const cx = x + dir * i * r * 2.7;
+    ctx.beginPath(); ctx.arc(cx, y, r, 0, Math.PI * 2);
+    if (i < n) {
+      const g = ctx.createRadialGradient(cx - r * 0.3, y - r * 0.3, r * 0.1, cx, y, r);
+      g.addColorStop(0, '#fff'); g.addColorStop(1, `rgb(${rgb})`);
+      ctx.fillStyle = g; ctx.fill();
+    } else {
+      ctx.strokeStyle = `rgba(${rgb},0.35)`; ctx.lineWidth = 1; ctx.stroke();
+    }
+  }
+}
+
+function drawHUD() {
+  const fs = Math.max(12, W * 0.024);
+  const top = H * 0.045;
+  txt('PONTOS ' + G.score, W * 0.04, top, fs, '#dff6ff', 'left', 6);
+  txt('NÍVEL ' + G.level, W / 2, top, fs, '#b6ff7a', 'center', 6);
+  txt('RECORDE ' + G.hi, W * 0.96, top, fs, '#dff6ff', 'right', 6);
+  const r = Math.max(4, W * 0.011);
+  drawLives(G.lives, Math.max(5, G.lives), W * 0.04 + r, top + fs * 1.35, 1, '70,150,255');
+  // resultado do jogo (nível): os teus pontos a azul, os do adversário a vermelho
+  const sy = top + fs * 1.4, gs = fs * 1.15;
+  txt(String(G.pm || 0), W / 2 - gs * 0.9, sy, gs, '#8fc4ff', 'center', 8);
+  txt('–', W / 2, sy, gs * 0.8, 'rgba(220,235,245,0.7)', 'center');
+  txt(String(G.po || 0), W / 2 + gs * 0.9, sy, gs, '#ff9a8a', 'center', 8);
+  // progresso para a próxima bola extra
+  const ac = (G.aces || 0) % 3;
+  txt('ASES ' + ac + '/3', W * 0.04, top + fs * 2.6, fs * 0.6, 'rgba(127,212,255,0.85)', 'left', 4);
+  if (G.muted) txt('SOM DESLIGADO (M)', W * 0.96, H - fs, fs * 0.6, 'rgba(200,220,240,0.6)', 'right');
+}
+
+function drawOverlays() {
+  const now = performance.now() / 1000;
+
+  if (G.banner) {
+    const b = G.banner, t = b.t / b.dur;
+    const a = t < 0.12 ? t / 0.12 : t > 0.8 ? (1 - t) / 0.2 : 1;
+    ctx.globalAlpha = clamp(a, 0, 1);
+    txt(b.text, W / 2, H * 0.40, Math.max(22, W * 0.065), b.color, 'center', 18);
+    if (b.sub) txt(b.sub, W / 2, H * 0.48, Math.max(11, W * 0.021), '#d8eefc', 'center', 6);
+    ctx.globalAlpha = 1;
+  }
+
+  G.pops.forEach((p, i) => {
+    const a = clamp(1 - p.t / 1.6, 0, 1);
+    ctx.globalAlpha = a;
+    txt(p.text, W / 2, H * 0.68 - p.t * H * 0.05 - (G.pops.length - 1 - i) * W * 0.03, Math.max(12, W * 0.024), p.color, 'center', 8);
+    ctx.globalAlpha = 1;
+  });
+
+  if (G.mode === 'title') {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+    txt('VIBEBALL', W / 2, H * 0.27, Math.max(34, W * 0.11), '#c8ff8a', 'center', 26);
+    const fs = Math.max(11, W * 0.021), lh = fs * 1.6;
+    const a = 0.55 + 0.45 * Math.sin(now * 4);
+    txt(IS_TOUCH ? 'TOCA PARA COMEÇAR' : 'CLICA PARA COMEÇAR', W / 2, H * 0.5, Math.max(15, W * 0.032), `rgba(230,255,220,${a})`, 'center', 12);
+    if (!IS_TOUCH) txt('P · pausa      M · som', W / 2, H * 0.6, fs * 0.85, 'rgba(180,205,225,0.7)', 'center', 0, 'normal');
+  }
+
+  if (G.mode === 'gameover') {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+    txt('FIM DO JOGO', W / 2, H * 0.33, Math.max(30, W * 0.085), '#ff8a8a', 'center', 22);
+    txt('PONTOS  ' + G.score, W / 2, H * 0.47, Math.max(16, W * 0.035), '#e8f6ff', 'center', 6);
+    txt('NÍVEL ATINGIDO  ' + G.level, W / 2, H * 0.54, Math.max(13, W * 0.026), '#b6ff7a', 'center', 6);
+    txt('RECORDE  ' + G.hi, W / 2, H * 0.60, Math.max(13, W * 0.026), '#dff6ff', 'center', 6);
+    if (performance.now() - G.overAt > 900) {
+      const a = 0.55 + 0.45 * Math.sin(now * 4);
+      txt(IS_TOUCH ? 'TOCA PARA JOGAR DE NOVO' : 'CLICA PARA JOGAR DE NOVO', W / 2, H * 0.72, Math.max(14, W * 0.03), `rgba(230,255,220,${a})`, 'center', 10);
+    }
+  }
+
+  if (G.paused) {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+    txt('PAUSA', W / 2, H * 0.45, Math.max(30, W * 0.08), '#e8f6ff', 'center', 16);
+    txt(IS_TOUCH ? 'Toca para continuar' : 'Clica para continuar', W / 2, H * 0.55, Math.max(11, W * 0.021), '#cfe3f2');
+  }
+}
+
+function draw() {
+  ctx.save();
+  if (G.shake > 0) ctx.translate(rnd(-1, 1) * G.shake * 14, rnd(-1, 1) * G.shake * 10);   // tremor do remate
+  if (MX.m > 0.01 && MX.cam) {     // tempo-bala: movimento de câmara (varia de cada vez)
+    const c = MX.cam, m = MX.m, tt = MX.on ? MX.t + (MX.phase === 'hold' ? 0.4 : 0) : 1.6;
+    const bp = P(ball.x, ball.y, clamp(ball.z, 0, TD));
+    let ang = 0, zoom = 1, fx = CX, fy = CY;
+    if (c.type === 'roll')  { ang = c.dir * 0.16 * c.amp * Math.min(1, tt / 1.6) * m; zoom = 1 + 0.04 * m; }        // rola devagar para um lado
+    if (c.type === 'orbit') { ang = Math.sin(tt * c.f * 2 + c.ph) * 0.07 * c.amp * m; zoom = 1 + 0.06 * m; }      // balança
+    if (c.type === 'dolly') { zoom = 1 + 0.22 * c.amp * Math.min(1, tt / 1.6) * m; fx = bp.x; fy = bp.y; }        // aproxima-se da bola
+    if (c.type === 'pull')  { zoom = 1 - 0.1 * c.amp * Math.min(1, tt / 1.6) * m; ang = c.dir * 0.03 * m; }       // afasta-se
+    if (c.type === 'tilt')  { ang = c.dir * 0.1 * c.amp * m; zoom = 1 + 0.12 * m; fx = bp.x; fy = bp.y; }          // inclina e centra na bola
+    ctx.translate(fx, fy); ctx.rotate(ang); ctx.scale(zoom, zoom); ctx.translate(-fx, -fy);
+  }
+  drawTunnel();
+  const gd = glitchDark();
+  if (gd > 0) { ctx.fillStyle = `rgba(0,0,0,${gd})`; ctx.fillRect(-20, -20, W + 40, H + 40); }   // luzes do túnel a falhar
+  const behind = ball.z > TD;
+  if (behind) drawBall();
+  ctx.globalAlpha = fogAt(TD) * 1.15 > 1 ? 1 : fogAt(TD) * 1.15;    // névoa: o adversário quase some ao fundo
+  if (!SQUASH) drawRacketRig(rigOp, op.x, op.y, TD - rigOp.z, PAL.op, TD);
+  const sqOp = () => { ctx.save(); ctx.globalAlpha = 0.55; drawRacketRig(rigOp, op.x, op.y, SQZ - rigOp.z * 0.3, PAL.op); ctx.restore(); };
+  if (SQUASH && ball.z <= SQZ) sqOp();
+  ctx.globalAlpha = 1;
+  drawFlashes();
+  drawDepthRing();
+  drawFire();
+  const inFront = ball.z < 0;
+  // a bola vê-se à frente ou atrás da rede, conforme o lado em que está
+  if (!behind && !inFront) {
+    if (NET && ball.z > TD / 2) { drawBall(); drawBallHeat(); drawNet(); }
+    else { drawNet(); drawBall(); drawBallHeat(); }
+  } else drawNet();
+  if (SQUASH && ball.z > SQZ) sqOp();    // squash: o adversário está à tua frente (bola atrás dele)
+  if (G.mode !== 'title') drawRacketRig(rigMe, me.x, me.y, rigMe.z, PAL.me);
+  if (inFront) { drawBall(); drawBallHeat(); }
+  if (gd > 0) { ctx.fillStyle = `rgba(0,0,0,${gd * 0.3})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+  if (VIS[visIdx].vign > 0) {     // escuridão nas margens (visibilidade reduzida)
+    const vg = ctx.createRadialGradient(CX, CY, Math.min(W, H) * 0.22, CX, CY, Math.max(W, H) * 0.62);
+    vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, `rgba(0,0,0,${VIS[visIdx].vign})`);
+    ctx.fillStyle = vg; ctx.fillRect(-20, -20, W + 40, H + 40);
+  }
+  drawGlitchSparks();
+  ctx.restore();
+  drawMatrix();
+  if (G.mode !== 'title') drawHUD();
+  if (gd > 0) { ctx.fillStyle = `rgba(0,0,0,${gd * 0.45})`; ctx.fillRect(0, 0, W, H); }
+  drawOverlays();
+}
+
+// --- Ciclo principal -------------------------------------------------------
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.05) dt = 0.05;
+  if (dt < 0) dt = 0;
+  if (!G.paused) { updateMatrix(dt); G.rdt = dt; update(dt * MX.scale); }
+  updateFlightSound();
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
+})();
+</script>
+</body>
+</html>

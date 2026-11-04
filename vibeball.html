@@ -1234,6 +1234,13 @@ function squashOppHit(isServe) {
   swingRig(rigOp, op.vx, op.vy, 0.7, op.x, op.y);
   addFlash(ball.x, ball.y, SQZ, PAL.op.glow);
 }
+// nível perdido: só há "vida extra" (repetir o nível) se tiveres pelo menos 5 bolas, e custa logo essas 5 bolas;
+// com menos de 5 bolas, o jogo acaba. Devolve o que acontece a seguir: 'regame' ou 'gameover'.
+function loseLevel() {
+  G.levelLosses = (G.levelLosses || 0) + 1;
+  if (G.lives >= 5) { G.lives -= 5; return 'regame'; }
+  return 'gameover';
+}
 function missMe() {
   if (MACH) { mcResult(false); return; }                 // lança-bolas: bola não devolvida
   if (PENALTY) { penResult('op', true); return; }        // golo do adversário: não defendeste
@@ -1244,9 +1251,7 @@ function missMe() {
   // contagem do ténis: 4 pontos com 2 de vantagem (com iguais/vantagem)
   G.po = (G.po || 0) + (dbl ? 2 : 1);
   if (G.po >= 4 && G.po - (G.pm || 0) >= 2) {
-    G.lives--;                  // perdeste o jogo (nível): perdes uma bola e repetes o nível
-    G.levelLosses = (G.levelLosses || 0) + 1;
-    G.after = (G.lives <= 0 || G.levelLosses >= 3) ? 'gameover' : 'regame';   // 3 jogos perdidos no mesmo nível: fim
+    G.after = loseLevel();      // perdeste o jogo (nível)
   } else G.after = 'serve';
 }
 function missOpp() {
@@ -1702,8 +1707,7 @@ function update(dt) {
             addScore(1000 * G.level);
             G.after = 'level'; G.mode = 'miss'; G.timer = 0.01;
           } else if (w === 'op') {               // perdeste a série: perdes uma bola e repetes
-            G.lives--; G.levelLosses = (G.levelLosses || 0) + 1;
-            G.after = (G.lives <= 0 || G.levelLosses >= 3) ? 'gameover' : 'regame';
+            G.after = loseLevel();
             G.mode = 'miss'; G.timer = 0.01;
           } else {
             PEN.turn = PEN.me.length > PEN.op.length ? 'op' : 'me';
@@ -1713,16 +1717,14 @@ function update(dt) {
           const ok = MC.shots.filter(Boolean).length, left = MC_N - MC.shots.length, need = mcNeed();
           if (ok >= need) { addScore(1000 * G.level); G.after = 'level'; G.mode = 'miss'; G.timer = 0.3; }   // mínimo atingido
           else if (ok + left < need) {                                     // já não dá: perdes uma bola e repetes
-            G.lives--; G.levelLosses = (G.levelLosses || 0) + 1;
-            G.after = (G.lives <= 0 || G.levelLosses >= 3) ? 'gameover' : 'regame'; G.mode = 'miss'; G.timer = 0.3;
+            G.after = loseLevel(); G.mode = 'miss'; G.timer = 0.3;
           } else toServe();
         } else if (G.after === 'tgt') {
           const tot = TG.shots.reduce((a2, v) => a2 + v, 0), left = TG_N - TG.shots.length, need = tgNeed();
           if (tot >= need) {                       // pontuação atingida: passa de nível
             addScore(1000 * G.level); G.after = 'level'; G.mode = 'miss'; G.timer = 0.01; TG.stuck = null;
           } else if (tot + 10 * left < need || left <= 0) {   // já não dá: perdes uma bola e repetes
-            G.lives--; G.levelLosses = (G.levelLosses || 0) + 1;
-            G.after = (G.lives <= 0 || G.levelLosses >= 3) ? 'gameover' : 'regame';
+            G.after = loseLevel();
             G.mode = 'miss'; G.timer = 0.01; TG.stuck = null;
           } else toServe();
         } else if (G.after === 'regame') {

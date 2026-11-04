@@ -152,12 +152,12 @@ function headFrom(fx, fy) {
 // Sem bloqueio (plano B): ganho de 1,15 → a raquete chega aos limites antes de o cursor chegar à borda.
 const LOCK = { on: false, x: 0, y: 0, lostAt: 0, since: 0, ax: 0, ay: 0, pending: false };
 const NO_LOCK = /nolock/.test(location.search);   // ?nolock desativa o bloqueio (testes)
-// testes: ?modo=alvo|penaltis|squash|rede|disco|crono|redondo|maquina força esse modo em todos os níveis; ?nivel=N começa no nível N
+// testes: ?modo=alvo|penaltis|squash|rede|disco|crono|redondo|rodar|maquina|fantasma|obstaculos força esse modo em todos os níveis; ?nivel=N começa no nível N
 const QS = new URLSearchParams(location.search);
 const FORCE_MODE = QS.get('modo') || null;
 const START_LEVEL = Math.max(1, parseInt(QS.get('nivel')) || 1);
 let FORCE_NEXT = null;   // (testes) força o modo do próximo nível
-const FORCE_IDX = { squash: 0, penaltis: 1, rede: 2, disco: 3, crono: 4, alvo: 5, redondo: 6, maquina: 7 }[FORCE_MODE];
+const FORCE_IDX = { squash: 0, penaltis: 1, rede: 2, disco: 3, crono: 4, alvo: 5, redondo: 6, rodar: 6, maquina: 7, fantasma: 8, obstaculos: 9 }[FORCE_MODE];
 const MOUSE_GAIN = 1.15, MOUSE_SENS = 1.1;
 function requestLock() {
   if (NO_LOCK || document.pointerLockElement === cv || !cv.requestPointerLock) return;
@@ -733,6 +733,14 @@ const sfx = {
       noise(d, t + 0.02, 'highpass', 3000, 0.7, 0.22, 0.18);                 // sopro do ar
     } catch (e) {}
   },
+  obstacle(depth) {   // bola na barra: pancada metálica oca, mais abafada ao longe
+    if (!audioOn()) return;
+    try {
+      const t = AC.currentTime + 0.001, d = out(ball.x / TX, depth);
+      noise(d, t, 'bandpass', 2200, 1.2, 0.05, 0.6);
+      tone(d, t, 'triangle', 880, 840, 0.25, 0.22); tone(d, t, 'sine', 1320, 1300, 0.18, 0.12);
+    } catch (e) {}
+  },
   target(pts) {   // bola cravada no alvo: pancada seca + vibração; o centro dá um sino
     if (!audioOn()) return;
     try {
@@ -885,13 +893,13 @@ function newGame() {
   themeIdx = 0; themePending = null; visIdx = 1; visPending = null; NET = null;
   buildVerb(TD_BASE);
   shotMemory.length = 0; op.fam = 0;
-  G.tempo = 1; G.tempoHist = []; G.score = 0; G.level = START_LEVEL; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.aceRun = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
-  SQUASH = false; squashPending = false; PENALTY = false; penPending = false; penReset(); DISCO = false; discoPending = false; TIMED = false; timedPending = false; TM.kind = ''; TARGET = false; targetPending = false; tgReset(); ROUND = false; roundPending = false; MACH = false; machPending = false; mcReset();
+  G.tempo = 1; G.tempoHist = []; G.pers = START_LEVEL > 1 ? pickPers(START_LEVEL) : 'eq'; persPending = G.pers; applyPers(); G.score = 0; G.level = START_LEVEL; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.aceRun = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
+  SQUASH = false; squashPending = false; PENALTY = false; penPending = false; penReset(); DISCO = false; discoPending = false; TIMED = false; timedPending = false; TM.kind = ''; TARGET = false; targetPending = false; tgReset(); ROUND = false; roundPending = false; RR.on = RR.pending = false; RR.a = 0; MACH = false; machPending = false; mcReset(); GHOST = false; ghostPending = false; OBST = false; obstPending = false; OB.length = 0;
   if (FORCE_IDX !== undefined) {                  // modo forçado (testes): já desde o primeiro nível
     const mi = FORCE_IDX;
     SQUASH = squashPending = mi === 0; PENALTY = penPending = mi === 1;
     NET = netPending = mi === 2 ? { top: TY - 0.42 } : null;
-    DISCO = discoPending = mi === 3; TIMED = timedPending = mi === 4; TARGET = targetPending = mi === 5; ROUND = roundPending = mi === 6; MACH = machPending = mi === 7;
+    DISCO = discoPending = mi === 3; TIMED = timedPending = mi === 4; TARGET = targetPending = mi === 5; ROUND = roundPending = mi === 6; RR.on = RR.pending = ROUND && FORCE_MODE === 'rodar'; if (RR.on) rrSetup(); MACH = machPending = mi === 7; GHOST = ghostPending = mi === 8; OBST = obstPending = mi === 9;
   }
   G.pops.length = 0; G.served = 0;
   op.x = op.y = 0;
@@ -922,6 +930,7 @@ function strokePower(v) { return clamp(Math.hypot(v.x, v.y) / 6, 0, 1); }
 // direção e velocidade de saída: a bola sai segundo a face da raquete (ângulo do gesto e da posição),
 // corrigida pelo ponto de impacto; o gesto dá potência e efeito
 function launch(px, py, v, mul, keep) {
+  ball.flipZ = 0; ball.burstZ = 0;
   const ox = clamp((ball.x - px) / PW, -1, 1);
   const oy = clamp((ball.y - py) / PH, -1, 1);
   const aim = faceAim(px, py, me.gx, me.gy);      // a mesma inclinação que se vê na face
@@ -1073,12 +1082,17 @@ function oppHit(weak, isServe) {
   let mul = 1;
   if (G.oppAttack && !weak) mul = Math.min(1.12 + 0.02 * L, 1.35);
   if (weak) mul = 0.72;
+  const pq = pers();
+  if (!weak) mul *= G.pers === 'imp' ? [0.78, 1, 1.22][Math.floor(Math.random() * 3)] : (pq.mul || 1);   // ritmo da personalidade
   ball.vz = -speed() * mul;
+  ball.flipZ = 0; ball.burstZ = 0;
+  if (!weak && G.pers === 'imp' && Math.random() < 0.35) ball.flipZ = TD * rnd(0.35, 0.6);   // efeito que se inverte a meio
+  if (!weak && G.pers === 'bat' && Math.random() < 0.2) ball.burstZ = TD * rnd(0.4, 0.6);    // bola que acelera a meio
   // escolhe um ponto de chegada: às vezes procura o lado oposto à tua raquete (mais vezes nos níveis altos),
   // às vezes joga para uma zona mais central — bolas legíveis, sem exageros
   op.read = false;
   const ts = tempoSkill();
-  const away = !weak && Math.random() < Math.min(0.1 + 0.05 * L + 0.1 * ts, 0.9);
+  const away = !weak && Math.random() < Math.min((0.1 + 0.05 * L + 0.1 * ts) * (pq.away || 1), 0.95);
   const sx = me.x === 0 ? (Math.random() < 0.5 ? -1 : 1) : -Math.sign(me.x);
   const sy = me.y === 0 ? (Math.random() < 0.5 ? -1 : 1) : -Math.sign(me.y);
   const tgx = away ? sx * rnd(0.3, 0.45 + Math.min(L, 8) * 0.03) : rnd(-0.3, 0.3) + me.x * 0.4;
@@ -1087,11 +1101,11 @@ function oppHit(weak, isServe) {
   ball.vx = clamp((tgx - ball.x) / tf + ox * 0.15 + rnd(-0.1, 0.1), -1.3, 1.3);
   ball.vy = clamp((tgy - ball.y) / tf + oy * 0.12 + rnd(-0.1, 0.1), -1.1, 1.1);
   // efeito do adversário: cresce devagar com o nível e tem limite
-  const cm = weak ? 0 : Math.min(0.1 * (L - 1), 2.4) * (1 + 0.45 * ts) * Math.sqrt(Math.random());
+  const cm = weak ? 0 : Math.min(0.1 * (L - 1), 2.4) * (1 + 0.45 * ts) * (pq.spin || 1) * Math.sqrt(Math.random());
   const ang = Math.random() * Math.PI * 2;
   setCurve(Math.cos(ang) * cm + op.vx * CURVE_K * 0.4, Math.sin(ang) * cm + op.vy * CURVE_K * 0.4);
   // durante a jogada também joga contra as paredes (mais vezes nos níveis altos)
-  if (!weak && !isServe && Math.random() < Math.min(0.12 + 0.03 * L + 0.12 * ts, 0.6)) {
+  if (!weak && !isServe && Math.random() < Math.min((0.12 + 0.03 * L + 0.12 * ts) * (pq.wall || 1), 0.7)) {
     wallAim(TD / Math.abs(ball.vz));
     setCurve(ball.cx * 0.4, ball.cy * 0.4);
   }
@@ -1297,8 +1311,9 @@ function physics(h) {
 }
 
 function hitTest(p) {
-  // cabeça oval: teste elíptico com margem para o raio da bola
-  const dx = (ball.x - p.x) / (PW + BR * 0.6), dy = (ball.y - p.y) / (PH + BR * 0.6);
+  // cabeça oval: teste elíptico com margem para o raio da bola (o batoteiro, quando "estica", chega mais longe)
+  const ch = p === op && op.cheat && G.pers === 'bat' ? 1.6 : 1;
+  const dx = (ball.x - p.x) / ((PW + BR * 0.6) * ch), dy = (ball.y - p.y) / ((PH + BR * 0.6) * ch);
   return dx * dx + dy * dy <= 1;
 }
 
@@ -1349,7 +1364,7 @@ function aiPlan(fresh, isServe) {
   const pL = predictFor({ ...ball, cx: 0, cy: 0 });
   const pC = predictFor(ball);
   const prog = SQUASH ? clamp((ball.vz > 0 ? ball.z : 2 * TD - ball.z) / (2 * TD - SQZ), 0, 1) : clamp(ball.z / TD, 0, 1);                   // a curva torna-se evidente à medida que a bola avança
-  const k = op.read ? 1 : clamp(sk * 0.35 + (op.fam || 0) * 0.45 + (1 - sk * 0.35) * prog * prog * 0.45 + 0.15 * tempoSkill(), 0, 1);   // técnicos: lê melhor os efeitos
+  const k = op.read ? 1 : clamp(sk * 0.35 + (op.fam || 0) * 0.45 + (1 - sk * 0.35) * prog * prog * 0.45 + 0.15 * tempoSkill() + (pers().read || 0), 0, 1);   // técnicos: lê melhor os efeitos
   if (fresh) {
     // erro fixo por bola: maior com bola rápida, com muito efeito e em jogadas longas
     const sp = Math.abs(ball.vz) / 2.2, spin = Math.hypot(ball.cx, ball.cy) / CMAX;
@@ -1359,13 +1374,15 @@ function aiPlan(fresh, isServe) {
     const e = ((0.02 + 0.13 * (1 - sk)) * (0.35 + 0.55 * sp + 0.85 * spin) + 0.01 * Math.max(0, Math.min(G.rally, 15) - 4)) * (1 + 1.5 * corner);
     const eS = SQUASH ? e * 1.7 : e;
     const tsk = 1 - 0.25 * tempoSkill();            // níveis técnicos: adversário mais certeiro
-    op.ex = rnd(-eS, eS) * tsk; op.ey = rnd(-eS, eS) * 0.8 * tsk;
+    const pq = pers(), pe = G.pers === 'imp' ? rnd(0.6, 1.6) : (pq.err || 1);   // personalidade: mais ou menos certeiro
+    op.ex = rnd(-eS, eS) * tsk * pe; op.ey = rnd(-eS, eS) * 0.8 * tsk * pe;
+    op.cheat = G.pers === 'bat' && Math.random() < 0.3;   // batoteiro: desta vez estica a raquete
     // squash: mais errático — às vezes lê mal a bola que volta da parede
     if (SQUASH && Math.random() < 0.05 + 0.008 * Math.min(G.rally, 10)) op.ex += (Math.random() < 0.5 ? -1 : 1) * rnd(0.3, 0.5);
     // de vez em quando lê mal a bola (mesmo uma bola simples): as jogadas não se eternizam
     if (G.rally > 6 && Math.random() < 0.006 * (Math.min(G.rally, 20) - 6)) {   // só o cansaço em jogadas longas
       op.ex += (Math.random() < 0.5 ? -1 : 1) * rnd(0.28, 0.45); }
-    op.react = AI.react(L) * Math.sqrt(TD / TD_BASE) * (SQUASH ? 1.4 : 1) / SR(L);   // bola mais lenta → tempos do adversário à mesma escala   // túnel curto: reage mais depressa
+    op.react = AI.react(L) * Math.sqrt(TD / TD_BASE) * (SQUASH ? 1.4 : 1) / SR(L) * (pers().react || 1);   // bola mais lenta → tempos do adversário à mesma escala   // túnel curto: reage mais depressa
     // serviço: quanto mais alto o nível, mais vezes "lê" o serviço logo à partida (arranca já para o lado certo)
     op.read = isServe && Math.random() < (PENALTY && G.server !== 'op'
       ? Math.min(TUN.penRead0 + TUN.penReadL * (L - 1), TUN.penReadMax)       // penáltis: lê pior o teu remate
@@ -1396,8 +1413,8 @@ function aiUpdate(dt) {
   // túnel longo dá-lhe mais tempo → um pouco mais lento (e o contrário nos curtos): dificuldade parecida em todos
   const tdk = Math.pow(TD_BASE / TD, TUN.aiExp);
   const sr = Math.pow(SR(L), 0.8);                 // um pouco menos lento do que a bola (compensa a maior deriva dos efeitos)
-  let vm = AI.vmax(L) * sr * tdk * Math.max(0.8, 1 - 0.012 * Math.min(G.rally, 15));
-  let am = AI.amax(L) * sr * sr * tdk * (SQUASH ? 0.8 : 1);
+  let vm = AI.vmax(L) * sr * tdk * Math.max(0.8, 1 - 0.012 * Math.min(G.rally, 15)) * (pers().spd || 1);
+  let am = AI.amax(L) * sr * sr * tdk * (SQUASH ? 0.8 : 1) * (pers().spd || 1);
   if (SQUASH) vm *= 0.8;
   if (ROUND) { vm *= TUN.roundAI; am *= TUN.roundAI; }   // túnel redondo: área menor → adversário mais lento (equilíbrio)
   // a receber o teu serviço: se adivinhou o serviço (op.antic), arranca muito mais depressa para lá
@@ -1580,6 +1597,14 @@ function update(dt) {
     for (let i = 0; i < n; i++) {
       const zPrev = ball.z;
       if (PENALTY && PEN.inNet) netBallStep(h); else physics(h);   // dentro da rede: física própria
+      if (obstHit(zPrev)) continue;                                  // obstáculos a rodar
+      if (G.mode === 'play' && ball.vz < 0 && ball.flipZ && ball.z < ball.flipZ) {   // imprevisível: o efeito inverte-se
+        ball.cx = -ball.cx * 1.3 - rnd(-0.4, 0.4); ball.cy = -ball.cy * 1.3 - rnd(-0.3, 0.3); ball.flipZ = 0;
+        addFlash(ball.x, ball.y, ball.z, PAL.op.glow, 1.2, 0.2); sfx.whoosh && sfx.whoosh(0.5);
+      }
+      if (G.mode === 'play' && ball.vz < 0 && ball.burstZ && ball.z < ball.burstZ) { // batoteiro: acelera a meio
+        ball.vz *= 1.3; ball.burstZ = 0; addFlash(ball.x, ball.y, ball.z, '255,220,80', 1.8, 0.25); sfx.matrixOut && sfx.matrixOut();
+      }
       if (G.mode === 'play' && netHitTest(zPrev)) {
         // bola na rede: trava e cai; perde o ponto quem bateu
         const mineShot = ball.vz > 0;
@@ -1639,6 +1664,7 @@ function update(dt) {
           G.mode = 'gameover'; G.overAt = performance.now(); sfx.over();
         } else if (G.after === 'level') {
           G.level++; G.opp = 3; G.pm = 0; G.po = 0; G.levelLosses = 0;
+          persPending = pickPers(G.level);        // personalidade do próximo adversário
           G.tempo = pickTempo(G.level);           // andamento do novo nível (rápido, médio ou técnico)
           // nível concluído: +1 bola (para prolongar o jogo)
           if (G.lives < MAX_LIVES) { G.lives++; pop('NÍVEL CONCLUÍDO · +1 BOLA', '#7fd4ff'); setTimeout(() => sfx.extra(), 450); }
@@ -1647,8 +1673,8 @@ function update(dt) {
           buildVerb(TD_TARGET);
           ballHueTarget = newBallHue(ballHueTarget);
           themePending = newTheme(themeIdx);
-          // modos especiais, todos com a mesma frequência (≈9,4% cada); os restantes 25% são ténis normal
-          const mi = FORCE_IDX !== undefined ? FORCE_IDX : FORCE_NEXT !== null ? FORCE_NEXT : Math.floor(Math.random() / (0.75 / 8));   // 0 squash · 1 penáltis · 2 rede · 3 discoteca · 4 cronometrado · 5 alvo · 6 redondo · 7 lança-bolas · ≥8 normal
+          // modos especiais, todos com a mesma frequência (7,5% cada); os restantes 25% são ténis normal
+          const mi = FORCE_IDX !== undefined ? FORCE_IDX : FORCE_NEXT !== null ? FORCE_NEXT : Math.floor(Math.random() / (0.75 / 10));   // 0 squash · 1 penáltis · 2 rede · 3 discoteca · 4 cronometrado · 5 alvo · 6 redondo · 7 lança-bolas · 8 fantasma · 9 obstáculos · ≥10 normal
           squashPending = mi === 0 && (G.level >= 3 || FORCE_IDX === 0);      // squash só a partir do nível 3 (antes disso, nível normal)
           penPending = mi === 1;
           netPending = mi === 2 ? { top: TY - rnd(0.36, 0.5) } : null;
@@ -1656,7 +1682,10 @@ function update(dt) {
           timedPending = mi === 4;
           targetPending = mi === 5;
           roundPending = mi === 6;
+          RR.pending = roundPending && (FORCE_MODE === 'rodar' || (FORCE_MODE !== 'redondo' && Math.random() < 0.5));
           machPending = mi === 7;
+          ghostPending = mi === 8;
+          obstPending = mi === 9;
           visPending = newVis();
           G.warp = { t: 0, dur: 2.3, A: 14 };      // viagem pelo túnel: as paredes correm em direção a ti
           sfx.whoosh(1.3, 0, 0, 0.5, 0, 1.3, 0.9);
@@ -1714,6 +1743,8 @@ function update(dt) {
   updateFire(dt);
   updateGlitch(dt);
   updateTimed(dt);
+  updateObst(dt);
+  updateRoundRot(dt);
   updateExplosion(dt);
   if (NET && NET.rip) { NET.rip.t += dt; if (NET.rip.t > 2.8) NET.rip = null; }
   if (ballHue !== ballHueTarget) {        // transição gradual da cor (pelo caminho mais curto no círculo)
@@ -1727,7 +1758,7 @@ function update(dt) {
     const u = Math.min(1, G.warp.t / G.warp.dur);
     G.warpPhase = G.warp.A * (1 - Math.cos(Math.PI * u)) / 2;
     G.warpGlow = Math.sin(Math.PI * u);
-    if (u >= 0.5 && themePending !== null) { themeIdx = themePending; themePending = null; NET = netPending; netPending = undefined; SQUASH = squashPending; PENALTY = penPending; if (PENALTY) penReset(); DISCO = discoPending; TIMED = timedPending; TM.kind = ''; TARGET = targetPending; tgReset(); ROUND = roundPending; MACH = machPending; mcReset();
+    if (u >= 0.5 && themePending !== null) { themeIdx = themePending; themePending = null; G.pers = persPending; applyPers(); NET = netPending; netPending = undefined; SQUASH = squashPending; PENALTY = penPending; if (PENALTY) penReset(); DISCO = discoPending; TIMED = timedPending; TM.kind = ''; TARGET = targetPending; tgReset(); ROUND = roundPending; RR.on = ROUND && RR.pending; RR.a = 0; if (RR.on) rrSetup(); MACH = machPending; mcReset(); GHOST = ghostPending; OBST = obstPending; OB.length = 0;
       if (G.mode === 'serve') toServe();   // o modo mudou a meio da viagem: refaz o serviço já com as regras do novo modo (bola, quem serve)
     }
     if (u >= 0.5 && visPending !== null) { visIdx = visPending; visPending = null; glitch.timer = rnd(15, 30); }   // troca de cenário no auge do clarão
@@ -1782,6 +1813,136 @@ let ROUND = false, roundPending = false;
 // modo lança-bolas (só no modo normal): no lugar do adversário, uma máquina dispara bolas seguidas, sem pausas,
 // para todos os lados. Série de 20; conta cada bola devolvida; mínimo a subir com o nível.
 let MACH = false, machPending = false;
+// modo bola fantasma (só no modo normal): a bola desaparece a meio do túnel e só se vê perto das pontas.
+// O anel de profundidade continua visível; a zona invisível alarga com o nível (30% → 60% do túnel).
+let GHOST = false, ghostPending = false;
+// modo obstáculos (só no modo normal): obstáculos a rodar (ora no sentido do relógio, ora ao contrário) em planos a meio do túnel. Se a bola lhes bate,
+// ressalta para trás (volta para quem bateu), com um desvio dado pela rotação da barra.
+// Mais barras, mais compridas e mais rápidas com o nível.
+let OBST = false, obstPending = false;
+// personalidades do adversário (uma por nível, a partir do nível 2; nunca a mesma duas vezes seguidas).
+// Cada uma tem a sua cor de raquete e o seu estilo de jogo:
+//  def  DEFENSIVO (verde): mais rápido e certeiro a defender; bolas mais lentas, centrais e com pouco efeito → trocas longas
+//  agr  AGRESSIVO (laranja): bolas fortes, colocadas, com muito efeito e muitas às paredes; mas reage mais tarde e erra mais
+//  imp  IMPREVISÍVEL (roxo): ritmo e efeitos ao acaso; às vezes o efeito inverte-se a meio da viagem
+//  bat  BATOTEIRO (dourado): às vezes "estica" a raquete (aura dourada) e às vezes a bola dele acelera a meio do túnel
+const PERS = {
+  eq:  { front: '255,70,70',  back: '150,25,30', glow: '255,90,90' },
+  def: { front: '60,220,160', back: '15,110,80', glow: '90,240,180', spd: 1.12, err: 0.8, react: 0.9, read: 0.1, mul: 0.9, away: 0.5, spin: 0.6, wall: 0.5 },
+  agr: { front: '255,130,30', back: '150,55,10', glow: '255,160,60', spd: 0.95, err: 1.3, react: 1.25, read: 0, mul: 1.15, away: 1.4, spin: 1.25, wall: 1.4 },
+  imp: { front: '190,90,255', back: '90,30,150', glow: '210,130,255', spin: 1.4 },
+  bat: { front: '255,210,40', back: '150,110,10', glow: '255,225,90' }
+};
+let persPending = 'eq';
+const pers = () => PERS[G.pers || 'eq'];
+function pickPers(L) {
+  if (L < 2) return 'eq';
+  const k = ['def', 'agr', 'imp', 'bat'].filter(x => x !== G.pers);
+  return k[Math.floor(Math.random() * k.length)];
+}
+function applyPers() { const q = pers(); PAL.op.front = q.front; PAL.op.back = q.back; PAL.op.glow = q.glow; }
+const OB = [];
+// formas possíveis (segmentos no referencial do obstáculo, à volta do eixo): cada nível escolhe uma diferente
+// da anterior, com cor, espessura e tamanho próprios
+const OB_SHAPES = {
+  barra:     L => [[-L / 2, 0, L / 2, 0]],
+  cruz:      L => [[-L * 0.4, 0, L * 0.4, 0], [0, -L * 0.4, 0, L * 0.4]],
+  helice:    L => [0, 1, 2].map(i => { const a = i * 2 * Math.PI / 3; return [0, 0, Math.cos(a) * L * 0.48, Math.sin(a) * L * 0.48]; }),
+  martelo:   L => [[0, 0, L * 0.62, 0], [L * 0.62, -L * 0.16, L * 0.62, L * 0.16]],
+  paralelas: L => [[-L * 0.45, -0.13, L * 0.45, -0.13], [-L * 0.45, 0.13, L * 0.45, 0.13]],
+  ziguezague: L => [[-L / 2, -0.08, -L / 6, 0.08], [-L / 6, 0.08, L / 6, -0.08], [L / 6, -0.08, L / 2, 0.08]],
+  estrela:   L => [0, 1, 2, 3, 4].map(i => { const a = i * 2 * Math.PI / 5; return [0, 0, Math.cos(a) * L * 0.42, Math.sin(a) * L * 0.42]; })
+};
+function obstSetup() {
+  OB.length = 0;
+  const L = G.level, n = L >= 16 ? 3 : L >= 8 ? 2 : 1;
+  const zs = n === 1 ? [0.5] : n === 2 ? [0.38, 0.64] : [0.3, 0.5, 0.7];
+  const names = Object.keys(OB_SHAPES).filter(k => k !== G.obstLast);
+  const shape = names[Math.floor(Math.random() * names.length)]; G.obstLast = shape;   // forma diferente do nível anterior
+  const hue = Math.floor(rnd(0, 360)), w = rnd(0.05, 0.09);
+  for (let i = 0; i < n; i++) {
+    const len = Math.min(0.85 + 0.02 * L, 1.35) * rnd(0.85, 1.1);
+    const sp = Math.min(0.45 + 0.035 * L, 1.4) * rnd(0.85, 1.15);
+    OB.push({
+      zf: zs[i] + rnd(-0.04, 0.04), segs: OB_SHAPES[shape](len), w, hue: (hue + i * 25) % 360,
+      ang: rnd(0, Math.PI * 2), spd: (Math.random() < 0.5 ? -1 : 1) * sp, sp, dir: 0, flipT: rnd(2, 5),
+      cx: rnd(-0.15, 0.15), cy: rnd(-0.1, 0.1), hit: 0
+    });
+  }
+}
+function updateObst(dt) {
+  if (!OBST) return;
+  if (!OB.length) obstSetup();
+  for (const o of OB) {
+    o.flipT -= dt;
+    if (o.flipT <= 0) { o.dir = o.spd > 0 ? -1 : 1; o.flipT = rnd(2.5, 6); }   // troca de sentido: relógio ↔ contra-relógio
+    if (o.dir) { o.spd += o.dir * o.sp * 2.2 * dt; if (Math.abs(o.spd) >= o.sp && Math.sign(o.spd) === o.dir) { o.spd = o.dir * o.sp; o.dir = 0; } }   // trava e arranca ao contrário
+    o.ang += o.spd * dt; o.hit = Math.max(0, o.hit - dt * 3);
+  }
+}
+// colisão no plano de cada obstáculo (chamada a cada subpasso, com a profundidade anterior da bola)
+function obstHit(zPrev) {
+  if (!OBST || G.mode !== 'play') return false;
+  for (const o of OB) {
+    const z0 = o.zf * TD;
+    if ((zPrev - z0) * (ball.z - z0) > 0) continue;                // não atravessou este plano
+    const ca = Math.cos(-o.ang), sa = Math.sin(-o.ang), rx0 = ball.x - o.cx, ry0 = ball.y - o.cy;
+    const lx = rx0 * ca - ry0 * sa, ly = rx0 * sa + ry0 * ca;       // posição da bola no referencial do obstáculo
+    let hitSeg = false;
+    for (const [ax, ay, bx, by] of o.segs) {
+      const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy, t = clamp(((lx - ax) * dx + (ly - ay) * dy) / l2, 0, 1);
+      if (Math.hypot(lx - (ax + dx * t), ly - (ay + dy * t)) <= o.w / 2 + BR) { hitSeg = true; break; }
+    }
+    if (!hitSeg) continue;
+    // ressalto: inverte a profundidade e recebe o "empurrão" do obstáculo a rodar naquele ponto (ω × r)
+    const dir = Math.sign(ball.vz);
+    ball.vz = -ball.vz * 0.92; ball.z = z0 - dir * 0.02;
+    ball.vx += -o.spd * ry0 * 0.6; ball.vy += o.spd * rx0 * 0.6; ball.cx *= 0.5; ball.cy *= 0.5;
+    o.hit = 1; addFlash(ball.x, ball.y, z0, '200,240,255', 1.3, 0.2); sfx.obstacle(z0 / TD);
+    G.turn = ball.vz > 0 ? 'op' : 'me';
+    if (ball.vz > 0) aiObserve(false);                                // a bola volta para o adversário: ele reage
+    return true;
+  }
+  return false;
+}
+function drawObst(far) {             // far: obstáculos atrás da bola (desenhados antes dela); senão, os da frente
+  if (!OBST) return;
+  for (const o of OB) {
+    const z = o.zf * TD;
+    if (far ? !(z > ball.z || !ball.visible) : (z > ball.z || !ball.visible)) continue;
+    const ca = Math.cos(o.ang), sa = Math.sin(o.ang), hw = o.w / 2, c = P(o.cx, o.cy, z), fa = fogAt(z);
+    const W2 = (x, y) => P(o.cx + x * ca - y * sa, o.cy + x * sa + y * ca, z);
+    ctx.save();
+    ctx.globalAlpha = 0.85 * fa;
+    ctx.shadowColor = `hsla(${o.hue},100%,70%,0.9)`; ctx.shadowBlur = 8 + 14 * o.hit;
+    for (const [ax, ay, bx, by] of o.segs) {
+      const dx = bx - ax, dy = by - ay, l = Math.hypot(dx, dy) || 1, nx = -dy / l * hw, ny = dx / l * hw;
+      const pts = [W2(ax + nx, ay + ny), W2(bx + nx, by + ny), W2(bx - nx, by - ny), W2(ax - nx, ay - ny)];
+      const g = ctx.createLinearGradient(pts[0].x, pts[0].y, pts[3].x, pts[3].y);
+      g.addColorStop(0, `hsla(${o.hue},60%,25%,0.85)`); g.addColorStop(0.5, `hsla(${o.hue},90%,${60 + 25 * o.hit}%,0.85)`); g.addColorStop(1, `hsla(${o.hue},60%,25%,0.85)`);
+      ctx.fillStyle = g; poly(pts); ctx.fill();
+      ctx.strokeStyle = `hsla(${o.hue},100%,80%,${0.7 + 0.3 * o.hit})`; ctx.lineWidth = Math.max(1, 1.5 * c.s); poly(pts); ctx.stroke();
+    }
+    ctx.shadowBlur = 0; ctx.fillStyle = `hsla(${o.hue},100%,88%,0.95)`;          // eixo
+    ctx.beginPath(); ctx.arc(c.x, c.y, Math.max(2, 0.03 * c.s * K), 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+function drawCheatAura() {           // aura dourada a mostrar o alcance "esticado" do batoteiro
+  const c = P(op.x, op.y, TD), rx = (PW + BR * 0.6) * 1.6 * c.s * K, ry = (PH + BR * 0.6) * 1.6 * c.s * K;
+  const pul = 0.6 + 0.4 * Math.sin(performance.now() / 90);
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = `rgba(255,215,70,${0.55 * pul})`; ctx.lineWidth = 2; ctx.shadowColor = 'rgba(255,210,60,0.9)'; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.ellipse(c.x, c.y, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+}
+function ghostAlpha(z) {
+  if (!GHOST) return 1;
+  const w = Math.min(0.3 + 0.015 * (G.level - 2), 0.6), a = 0.5 - w / 2, b = 0.5 + w / 2, e = 0.07, u = z / TD;
+  if (u <= a - e || u >= b + e) return 1;
+  if (u >= a && u <= b) return 0;
+  return u < a ? (a - u) / e : (u - b) / e;            // transição suave à entrada e à saída da zona invisível
+}
 const MC = { shots: [], ax: 0, ay: 0, tx: 0, ty: 0, t: 0, flash: 0 };
 const MC_N = 20, MC_Y = 0.22;                       // posição do canhão (centro, um pouco abaixo do meio)
 const mcNeed = () => Math.round(MC_N * Math.min(0.55 + 0.012 * (G.level - 2), 0.75));   // 11 no nível 2 → 15 (máx.)
@@ -1846,6 +2007,17 @@ function mcResult(ok) {
   G.timer = ok ? Math.max(0.2, 0.45 - 0.012 * (G.level - 1)) : 0.6;   // sem pausas: a próxima segue logo
 }
 const RT = TY, RLB = RT - BR, RPAD = RT - PH;
+// variante do túnel redondo: as paredes rodam à volta do eixo (metade dos níveis redondos). A bola que bate na
+// parede é "arrastada" no sentido da rotação. O sentido troca de vez em quando; roda mais depressa nos níveis altos.
+const RR = { on: false, pending: false, a: 0, w: 0, sp: 0, dir: 0, flipT: 6 };
+function rrSetup() { RR.sp = Math.min(0.35 + 0.03 * G.level, 1.2); RR.w = (Math.random() < 0.5 ? -1 : 1) * RR.sp; RR.dir = 0; RR.flipT = rnd(4, 8); }
+function updateRoundRot(dt) {
+  if (!ROUND || !RR.on) return;
+  RR.flipT -= dt;
+  if (RR.flipT <= 0) { RR.dir = RR.w > 0 ? -1 : 1; RR.flipT = rnd(4, 8); }        // vai trocar de sentido
+  if (RR.dir) { RR.w += RR.dir * RR.sp * 1.5 * dt; if (Math.sign(RR.w) === RR.dir && Math.abs(RR.w) >= RR.sp) { RR.w = RR.dir * RR.sp; RR.dir = 0; } }
+  RR.a += RR.w * dt;
+}
 function roundReflect(o) {          // ressalto na parede curva (reflexão em relação à normal)
   const r = Math.hypot(o.x, o.y);
   if (r <= RLB) return false;
@@ -1856,6 +2028,10 @@ function roundReflect(o) {          // ressalto na parede curva (reflexão em re
   const cn = o.cx * nx + o.cy * ny;                       // a parede consome sobretudo o efeito que empurra contra ela
   if (cn > 0) { o.cx -= cn * nx * 0.45; o.cy -= cn * ny * 0.45; }
   o.cx *= 0.9; o.cy *= 0.9;
+  if (RR.on) {                       // parede a rodar: arrasta a bola na direção tangente (atrito)
+    const tx = -ny, ty = nx, vt = o.vx * tx + o.vy * ty, dv = (RR.w * RLB - vt) * 0.65;
+    o.vx += tx * dv; o.vy += ty * dv; o.cx += tx * dv * 0.9; o.cy += ty * dv * 0.9;   // e ganha algum efeito nesse sentido
+  }
   return true;
 }
 function padClamp(o) {              // raquetes (e alvos do adversário) dentro do círculo
@@ -2224,7 +2400,7 @@ function drawTunnelRound() {
   const T = THEMES[themeIdx], V = VIS[visIdx];
   const wv = G.warpGlow || 0, ph = G.warpPhase || 0, wfr = ph - Math.floor(ph), wint = Math.floor(ph);
   const N = T.rings, c0 = P(0, 0, 0), cf = P(0, 0, TD), R0 = RT * c0.s * K, Rf = RT * cf.s * K;
-  const at = (a, z) => P(Math.cos(a) * RT, Math.sin(a) * RT, z);
+  const at = (a, z) => P(Math.cos(a + RR.a) * RT, Math.sin(a + RR.a) * RT, z);   // + rotação das paredes (variante)
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   // parede: anel entre o círculo da frente e o do fundo, a escurecer em profundidade
   const g = ctx.createRadialGradient(cf.x, cf.y, Rf, c0.x, c0.y, R0);
@@ -2874,7 +3050,8 @@ function drawFire() {
   for (let i = 0; i < n; i++) {
     const q = fire.trail[i];
     if (q.z < -0.35) continue;
-    const pp = P(q.x, q.y, q.z), f = (i + 1) / n;
+    const gq = ghostAlpha(q.z); if (gq <= 0.005) continue;   // o fogo também não denuncia a bola fantasma
+    const pp = P(q.x, q.y, q.z), f = (i + 1) / n * gq;
     const r = BR * pp.s * K * (0.28 + 0.65 * f) * (1 + k * 0.32);
     const g = ctx.createRadialGradient(pp.x, pp.y, 0, pp.x, pp.y, r * 1.9);
     g.addColorStop(0, `rgba(255,255,235,${0.32 * f * k})`);
@@ -3092,9 +3269,11 @@ function drawBall() {
   const r = BR * p.s * K;
   if (r < 0.5) return;
   if (TIMED) { drawGrenade(p, r); return; }       // cronometrado: a bola é uma granada
+  const gh = G.mode === 'boom' ? 1 : ghostAlpha(ball.z);   // bola fantasma
+  if (gh <= 0.005) return;
   const depth = clamp(ball.z / TD, 0, 1);
   ctx.save();
-  ctx.globalAlpha = (G.mode === 'boom' ? 1 : ball.z > TD ? clamp(1 - (ball.z - TD) / (PENALTY ? 1.4 : 0.6), 0, 1) : 1) * fogAt(Math.min(ball.z, TD));
+  ctx.globalAlpha = (G.mode === 'boom' ? 1 : ball.z > TD ? clamp(1 - (ball.z - TD) / (PENALTY ? 1.4 : 0.6), 0, 1) : 1) * fogAt(Math.min(ball.z, TD)) * gh;
   const h = Math.round(ballHue);
   ctx.shadowColor = `hsla(${h},100%,65%,0.8)`;
   ctx.shadowBlur = r * (DISCO ? 1.8 : 0.9);      // discoteca: brilho mais forte para se ver bem no escuro
@@ -3487,6 +3666,7 @@ function draw() {
   drawSquashLines();
   drawGoal();
   ctx.globalAlpha = fogAt(TD) * 1.15 > 1 ? 1 : fogAt(TD) * 1.15;    // névoa: o adversário quase some ao fundo
+  if (G.pers === 'bat' && op.cheat && !TARGET && !MACH && ball.vz > 0 && G.mode === 'play') drawCheatAura();   // batoteiro a esticar a raquete
   if (TARGET) drawTarget();
   else if (MACH) drawMachine();
   else if (!SQUASH) drawRacketRig(rigOp, op.x, op.y, TD - rigOp.z, PAL.op, TD);
@@ -3501,8 +3681,8 @@ function draw() {
   // a bola vê-se à frente ou atrás da rede, conforme o lado em que está
   if (!behind && !inFront) {
     if (NET && ball.z > TD / 2) { drawBall(); drawBallHeat(); drawNet(); }
-    else { drawNet(); drawBall(); drawBallHeat(); }
-  } else drawNet();
+    else { drawNet(); drawObst(true); drawBall(); drawBallHeat(); drawObst(false); }   // barras atrás e à frente da bola
+  } else { drawNet(); drawObst(true); drawObst(false); }
   if (SQUASH && ball.z > SQZ) sqOp();    // squash: o adversário está à tua frente (bola atrás dele)
   if (G.mode !== 'title') drawRacketRig(rigMe, me.x, me.y, rigMe.z, PAL.me);
   if (inFront) { drawBall(); drawBallHeat(); }
@@ -3534,7 +3714,7 @@ function frame(now) {
 }
 requestAnimationFrame(frame);
 
-window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setDisco: v => { DISCO = v; }, DSC, setTimed: v => { TIMED = v; }, TM, EXP, boomGrenade, setTarget: v => { TARGET = v; tgReset(); }, TG, setRound: v => { ROUND = v; }, predictArrival, setMach: v => { MACH = v; mcReset(); }, setNextMode: i => { FORCE_NEXT = i; }, lvSpeed, SR, pickTempo, MC, mcNeed, tgCurveK, tgR, tgNeed, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
+window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setDisco: v => { DISCO = v; }, DSC, setTimed: v => { TIMED = v; }, TM, EXP, boomGrenade, setTarget: v => { TARGET = v; tgReset(); }, TG, setRound: v => { ROUND = v; }, RR, setRoundRot: v => { RR.on = v; if (v) rrSetup(); }, predictArrival, setMach: v => { MACH = v; mcReset(); }, setNextMode: i => { FORCE_NEXT = i; }, lvSpeed, SR, pickTempo, setGhost: v => { GHOST = v; }, setObst: v => { OBST = v; OB.length = 0; }, OB, setPers: k => { G.pers = k; applyPers(); }, MC, mcNeed, tgCurveK, tgR, tgNeed, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
 })();
 </script>
 </body>

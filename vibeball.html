@@ -1539,12 +1539,13 @@ function update(dt) {
       G.toss.vy += 3.2 * dt;
       ball.y += G.toss.vy * dt;
       if (ball.y > 0.55) {
-        G.toss = null; ball.x = 0; ball.y = 0;
-        if (PENALTY) penResult('me', false);                    // penálti: deixar cair a bola é falhar
-        else if (TARGET) tgResult(0);                           // alvo: deixar cair a bola é um tiro falhado
+        G.toss = null;
+        if (PENALTY) { ball.visible = false; penResult('me', false); }   // penálti falhado: a bola não volta ao teu lado
+        else if (TARGET) { ball.visible = false; tgResult(0); }          // alvo: tiro falhado
         else {
           G.faults = (G.faults || 0) + 1;                        // bola falhada no serviço = falha
           if (G.faults >= 2) { G.nextServer = 'op'; toServe(); } // 2.ª falha seguida: serve o adversário
+          else { ball.x = 0; ball.y = 0; }                       // 1.ª falha: a bola volta ao centro para repetires
         }
       }
       // durante o lançamento basta um gesto rápido através da bola (ou o clique)

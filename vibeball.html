@@ -1663,11 +1663,11 @@ function tgScore() {
   return 10 - 2 * Math.min(4, Math.floor(d / (R / 5)));
 }
 const TM = { kind: '', t: 0, total: 0, tick: 0 };
-const tmServeTime = () => Math.max(2.2, 3 - 0.03 * (G.level - 1));
+const tmServeTime = () => TARGET ? 5 : Math.max(2.2, 3 - 0.03 * (G.level - 1));   // tiro ao alvo: 5 s para cada remate
 const tmPointTime = () => Math.max(6, 10 - 0.15 * (G.level - 1)) * Math.pow(TD / TD_BASE, 0.4);   // túneis longos: mais tempo
 function tmStart(kind) { TM.kind = kind; TM.total = TM.t = kind === 'serve' ? tmServeTime() : tmPointTime(); TM.tick = Math.ceil(TM.t); }
 function updateTimed(dt) {
-  if (!TIMED) { TM.kind = ''; return; }
+  if (!TIMED && !TARGET) { TM.kind = ''; return; }   // cronometrado, ou só o tempo de remate no tiro ao alvo
   if (G.warp || Math.abs(TD - TD_TARGET) > 0.01) return;               // parado na viagem entre níveis
   if (G.mode === 'serve' && G.server !== 'op') { if (TM.kind !== 'serve') tmStart('serve'); }
   else if (!(G.mode === 'play' && TM.kind === 'point')) { if (G.mode !== 'play') TM.kind = ''; return; }
@@ -1676,7 +1676,8 @@ function updateTimed(dt) {
   if (sec < TM.tick) { TM.tick = sec; if (sec >= 1 && sec <= 3) sfx.tick(sec === 1); }   // tique-taque nos últimos 3 s
   if (TM.t <= 0) {                                                       // tempo esgotado: perdes o ponto
     TM.kind = ''; G.toss = null; fire.k = 0;
-    sfx.timeUp(); missMe();
+    sfx.timeUp();
+    if (TARGET) tgResult(0); else missMe();                             // alvo: remate perdido (0 pontos)
   }
 }
 // modo grandes penalidades (ocasional): série de 5 serviços alternados (tu primeiro); o objetivo é fazer ás.
@@ -2721,8 +2722,8 @@ function drawHUD() {
     txt('–', W / 2, sy, gs * 0.8, 'rgba(220,235,245,0.7)', 'center');
     txt(String(G.po || 0), W / 2 + gs * 0.9, sy, gs, '#ff9a8a', 'center', 8);
   }
-  if (TIMED && TM.kind) {             // cronometrado: barra a esvaziar (amarela e depois vermelha a piscar no fim)
-    const bw = Math.max(90, W * 0.16), bh = Math.max(4, fs * 0.28), bx = W / 2 - bw / 2, by = sy + gs * 0.75;
+  if ((TIMED || TARGET) && TM.kind) {   // barra do tempo a esvaziar (amarela e depois vermelha a piscar no fim)
+    const bw = Math.max(90, W * 0.16), bh = Math.max(4, fs * 0.28), bx = W / 2 - bw / 2, by = sy + gs * (TARGET ? 1.05 : 0.75);
     const fr = clamp(TM.t / TM.total, 0, 1), low = TM.t <= 3;
     const blink = low && (TM.t % 0.5) < 0.25;
     ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(bx, by, bw, bh);

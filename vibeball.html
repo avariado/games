@@ -1632,7 +1632,7 @@ const tgTD = () => TD_TARGET / TD_BASE;
 const tgR = () => clamp(0.4 * Math.pow(tgTD(), 0.5), 0.32, 0.55);
 const tgCurveK = () => 0.6 * Math.min(1, Math.pow(1 / tgTD(), 0.5));   // efeito da bola atenuado no tiro ao alvo
 const TGX = () => TX - tgR() - 0.02, TGY = () => TY - tgR() - 0.02;   // o alvo fica sempre todo dentro do túnel
-const tgNeed = () => Math.round(Math.min(15 + 1.5 * (G.level - 2), 45));   // 15 pontos no nível 2, +1,5 por nível, até 45 (o túnel já é compensado no alvo)
+const tgNeed = () => Math.round(Math.min(15 + 1.5 * (G.level - 2), 40));   // 15 pontos no nível 2, +1,5 por nível, até 40 (o túnel já é compensado no alvo)
 function tgReset() { TG.shots = []; TG.stuck = null; TG.shake = 0; }
 function tgMove(dt) {                // alvo a deslizar entre pontos ao acaso; mais rápido com o nível
   const L = G.level, v = Math.min(0.12 + 0.035 * (L - 2), 0.95) * (1 + 0.03 * OVR(L)) * Math.min(1.15, Math.pow(1 / tgTD(), 0.6));

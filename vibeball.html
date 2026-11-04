@@ -2817,7 +2817,10 @@ function discoAudio(i, when) {
     if (!DSC.bus) {
       DSC.bus = AC.createGain(); DSC.bus.gain.value = 0.32;
       // saída: seco + reverberação espacial longa (quase nada durante o nível; toda ao sair dele)
-      DSC.dry = AC.createGain(); DSC.dry.gain.value = 1; DSC.bus.connect(DSC.dry); DSC.dry.connect(MASTER);
+      // saída comum com filtro: ao entrar no nível seguinte a música fica abafada, "lá para trás"
+      DSC.out = AC.createGain(); DSC.out.gain.value = 1; DSC.out.connect(MASTER);
+      DSC.lp = AC.createBiquadFilter(); DSC.lp.type = 'lowpass'; DSC.lp.frequency.value = 20000; DSC.lp.Q.value = 0.5; DSC.lp.connect(DSC.out);
+      DSC.dry = AC.createGain(); DSC.dry.gain.value = 1; DSC.bus.connect(DSC.dry); DSC.dry.connect(DSC.lp);
       DSC.send = AC.createGain(); DSC.send.gain.value = 0.06; DSC.bus.connect(DSC.send);
       // reverberação de sala grande (tipo pavilhão/clube vazio): cauda de ~4,5 s, natural, só a abafar um pouco no fim
       const sr = AC.sampleRate, len = Math.floor(sr * 5), ir = AC.createBuffer(2, len, sr), RT = 4.5;
@@ -2832,13 +2835,13 @@ function discoAudio(i, when) {
       const cv = AC.createConvolver(); cv.buffer = ir;
       const hp = AC.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 240;   // sem graves na reverberação (não embala o bombo)
       DSC.wet = AC.createGain(); DSC.wet.gain.value = 1;
-      DSC.send.connect(hp); hp.connect(cv); cv.connect(DSC.wet); DSC.wet.connect(MASTER);
+      DSC.send.connect(hp); hp.connect(cv); cv.connect(DSC.wet); DSC.wet.connect(DSC.lp);
       DSC.lead = AC.createGain(); DSC.lead.gain.value = 1; DSC.lead.connect(DSC.bus);
       DSC.dly = AC.createDelay(1); DSC.dly.delayTime.value = DSC_STEP * 3;      // eco em colcheia com ponto
       // o eco sai à parte (direto + reverberação): ao sair do nível continua a repetir o riff enquanto desaparece
       DSC.fb = AC.createGain(); DSC.fb.gain.value = 0.42; DSC.echo = AC.createGain(); DSC.echo.gain.value = 0.35 * 0.32;
       DSC.lead.connect(DSC.dly); DSC.dly.connect(DSC.fb); DSC.fb.connect(DSC.dly); DSC.dly.connect(DSC.echo);
-      DSC.echo.connect(MASTER); DSC.echo.connect(DSC.send);
+      DSC.echo.connect(DSC.lp); DSC.echo.connect(DSC.send);
     }
     const b = DSC.bus, st = i % 16, bar = Math.floor(i / 16) % 4;
     if (st % 4 === 0) {                                                                // bombo seco e curto (deixa espaço ao baixo)
@@ -2869,17 +2872,21 @@ function updateDisco(dt) {
   if (AC && DSC.bus) {
     const now = AC.currentTime, g = (n, v) => { n.gain.cancelScheduledValues(now); n.gain.setValueAtTime(v, now); };
     if (DISCO && DSC.leaving && (!G.warp || DSC.leaveT > 3)) {   // volta a haver discoteca: som normal
-      DSC.leaving = false; g(DSC.dry, 1); g(DSC.send, 0.06); g(DSC.bus, 0.32); g(DSC.fb, 0.42); g(DSC.echo, 0.35 * 0.32);
+      DSC.leaving = false; g(DSC.dry, 1); g(DSC.send, 0.06); g(DSC.bus, 0.32); g(DSC.fb, 0.42); g(DSC.echo, 0.35 * 0.32); g(DSC.out, 1);
+      DSC.lp.frequency.cancelScheduledValues(now); DSC.lp.frequency.setValueAtTime(20000, now);
     }
     if (DISCO && G.warp && !discoPending && !DSC.leaving) {
       DSC.leaving = true; DSC.leaveT = 0;
-      // a música continua ~3 s, cada vez mais "molhada" de reverberação; depois param as notas e fica
-      // a própria música a ressoar: a cauda da reverberação e o eco do riff, a desaparecer até ao nível seguinte
-      g(DSC.dry, DSC.dry.gain.value); DSC.dry.gain.linearRampToValueAtTime(0.0001, now + DSC_FADE);
-      g(DSC.send, DSC.send.gain.value); DSC.send.gain.linearRampToValueAtTime(0.85, now + 1.4);
-      g(DSC.fb, DSC.fb.gain.value); DSC.fb.gain.linearRampToValueAtTime(0.62, now + 1);
-      g(DSC.echo, DSC.echo.gain.value); DSC.echo.gain.linearRampToValueAtTime(0.2, now + 1.5);
-      DSC.echo.gain.setValueAtTime(0.2, now + DSC_FADE); DSC.echo.gain.linearRampToValueAtTime(0.0001, now + DSC_FADE + 6);
+      // ecrã de transição: a música continua, com reverberação moderada a crescer;
+      // ao entrar no nível seguinte fica abafada (filtro a fechar) e afasta-se até desaparecer, "lá para trás"
+      const ent = now + Math.max(0.5, G.warp.dur - G.warp.t);            // momento em que entra o novo nível
+      g(DSC.send, DSC.send.gain.value); DSC.send.gain.linearRampToValueAtTime(0.32, now + 1.5);
+      g(DSC.fb, DSC.fb.gain.value); DSC.fb.gain.linearRampToValueAtTime(0.5, now + 1);
+      g(DSC.dry, DSC.dry.gain.value); DSC.dry.gain.linearRampToValueAtTime(0.6, ent); DSC.dry.gain.linearRampToValueAtTime(0.0001, now + DSC_FADE);
+      DSC.lp.frequency.cancelScheduledValues(now); DSC.lp.frequency.setValueAtTime(20000, now);
+      DSC.lp.frequency.setValueAtTime(20000, ent - 0.3); DSC.lp.frequency.exponentialRampToValueAtTime(900, ent + 0.6);
+      DSC.lp.frequency.exponentialRampToValueAtTime(300, ent + 4);
+      g(DSC.out, 1); DSC.out.gain.setValueAtTime(1, ent); DSC.out.gain.linearRampToValueAtTime(0.0001, ent + 4.5);
     }
   }
   if (DSC.leaving) DSC.leaveT += dt;

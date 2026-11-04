@@ -830,9 +830,28 @@ function updateFlightSound() {
 }
 
 // --- Lógica de jogo ------------------------------------------------------
+// velocidade por nível = envolvente que cresce SEMPRE (sem teto) × "andamento" do nível.
+// A partir do nível 6 cada nível tem um andamento: RÁPIDO (100%), MÉDIO (85%) ou TÉCNICO (70%).
+// Os níveis mais lentos compensam com perícia: efeitos mais fortes, mais colocação e ressaltos, adversário
+// a ler melhor. Assim os níveis altos alternam entre muito rápidos e mais lentos mas exigentes.
+// SR = razão face à curva antiga (com a qual o adversário foi calibrado): mantém-no à escala da bola.
+const lvEnv = L => L <= 20 ? 1.85 + 0.15 * (L - 1) : 4.7 + 0.06 * (L - 20);
+const lvSpeed = L => lvEnv(L) * (G.tempo || 1);
+const tempoSkill = () => clamp((1 - (G.tempo || 1)) / 0.3, 0, 1);   // 0 nos níveis rápidos → 1 nos técnicos
+function pickTempo(L) {
+  if (L < 6) return 1;
+  const h = G.tempoHist || (G.tempoHist = []);
+  let r = Math.random(), t = r < 0.4 ? 1 : r < 0.75 ? 0.85 : 0.7;
+  if (t === 1 && h.length >= 2 && h[h.length - 1] === 1 && h[h.length - 2] === 1) t = Math.random() < 0.5 ? 0.85 : 0.7;   // nunca 3 rápidos seguidos
+  if (t === 0.7 && h.length && h[h.length - 1] === 0.7) t = 1;                                                            // nem 2 técnicos seguidos
+  h.push(t); if (h.length > 6) h.shift();
+  return t;
+}
+const lvSpeedOld = L => Math.min(1.85 + 0.17 * (L - 1), 4.8) * (1 + 0.012 * OVR(L));
+const SR = L => lvSpeed(L) / lvSpeedOld(L);
 function speed() {
   // a velocidade acompanha parcialmente o comprimento do túnel
-  const base = Math.min(1.85 + 0.17 * (G.level - 1), 4.8) * (1 + 0.012 * OVR(G.level)) * Math.pow(TD / TD_BASE, TUN.speedExp);
+  const base = lvSpeed(G.level) * Math.pow(TD / TD_BASE, TUN.speedExp);
   // squash: o percurso é o dobro (ida à parede e volta) → bola mais rápida
   return base * (SQUASH ? 1.45 : 1) * (1 + Math.min(G.rally, 12) * 0.025);   // a bola acelera ligeiramente durante a jogada
 }
@@ -866,7 +885,7 @@ function newGame() {
   themeIdx = 0; themePending = null; visIdx = 1; visPending = null; NET = null;
   buildVerb(TD_BASE);
   shotMemory.length = 0; op.fam = 0;
-  G.score = 0; G.level = START_LEVEL; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.aceRun = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
+  G.tempo = 1; G.tempoHist = []; G.score = 0; G.level = START_LEVEL; G.lives = 5; G.opp = 3; G.rally = 0; G.aces = 0; G.aceRun = 0; G.pm = 0; G.po = 0; G.levelLosses = 0;
   SQUASH = false; squashPending = false; PENALTY = false; penPending = false; penReset(); DISCO = false; discoPending = false; TIMED = false; timedPending = false; TM.kind = ''; TARGET = false; targetPending = false; tgReset(); ROUND = false; roundPending = false; MACH = false; machPending = false; mcReset();
   if (FORCE_IDX !== undefined) {                  // modo forçado (testes): já desde o primeiro nível
     const mi = FORCE_IDX;
@@ -1058,7 +1077,8 @@ function oppHit(weak, isServe) {
   // escolhe um ponto de chegada: às vezes procura o lado oposto à tua raquete (mais vezes nos níveis altos),
   // às vezes joga para uma zona mais central — bolas legíveis, sem exageros
   op.read = false;
-  const away = !weak && Math.random() < Math.min(0.1 + 0.045 * L, 0.7);
+  const ts = tempoSkill();
+  const away = !weak && Math.random() < Math.min(0.1 + 0.05 * L + 0.1 * ts, 0.9);
   const sx = me.x === 0 ? (Math.random() < 0.5 ? -1 : 1) : -Math.sign(me.x);
   const sy = me.y === 0 ? (Math.random() < 0.5 ? -1 : 1) : -Math.sign(me.y);
   const tgx = away ? sx * rnd(0.3, 0.45 + Math.min(L, 8) * 0.03) : rnd(-0.3, 0.3) + me.x * 0.4;
@@ -1067,11 +1087,11 @@ function oppHit(weak, isServe) {
   ball.vx = clamp((tgx - ball.x) / tf + ox * 0.15 + rnd(-0.1, 0.1), -1.3, 1.3);
   ball.vy = clamp((tgy - ball.y) / tf + oy * 0.12 + rnd(-0.1, 0.1), -1.1, 1.1);
   // efeito do adversário: cresce devagar com o nível e tem limite
-  const cm = weak ? 0 : Math.min(0.09 * (L - 1), 1.8) * Math.sqrt(Math.random());
+  const cm = weak ? 0 : Math.min(0.1 * (L - 1), 2.4) * (1 + 0.45 * ts) * Math.sqrt(Math.random());
   const ang = Math.random() * Math.PI * 2;
   setCurve(Math.cos(ang) * cm + op.vx * CURVE_K * 0.4, Math.sin(ang) * cm + op.vy * CURVE_K * 0.4);
   // durante a jogada também joga contra as paredes (mais vezes nos níveis altos)
-  if (!weak && !isServe && Math.random() < Math.min(0.12 + 0.025 * L, 0.35)) {
+  if (!weak && !isServe && Math.random() < Math.min(0.12 + 0.03 * L + 0.12 * ts, 0.6)) {
     wallAim(TD / Math.abs(ball.vz));
     setCurve(ball.cx * 0.4, ball.cy * 0.4);
   }
@@ -1081,7 +1101,7 @@ function oppHit(weak, isServe) {
                            : ['plano', 'desce', 'sobe', 'canto', 'efeito', 'parede', 'parede'];
     const stl = styles[Math.floor(Math.random() * styles.length)];
     const sd = Math.random() < 0.5 ? -1 : 1, sv = Math.random() < 0.5 ? -1 : 1;
-    const ce = Math.min(0.5 + 0.08 * (L - 1), 1.8) * (PENALTY ? 1.3 : 1);   // efeito máximo (cresce com o nível)
+    const ce = Math.min(0.5 + 0.09 * (L - 1), 2.3) * (PENALTY ? 1.3 : 1) * (1 + 0.35 * ts);   // efeito máximo (cresce com o nível)
     let tx = rnd(-0.35, 0.35), ty = rnd(-0.2, 0.2), cx = 0, cy = 0, sm = rnd(0.92, 1.08);
     if (stl === 'desce')  { ty = rnd(0.3, 0.5);   cy = ce * rnd(0.3, 0.7); }        // bate no alto e cai a pique
     if (stl === 'sobe')   { ty = rnd(-0.5, -0.3); cy = -ce * rnd(0.2, 0.5); }       // sai baixo e sobe
@@ -1292,7 +1312,7 @@ function hitTest(p) {
 //    puxá-lo para um lado e jogar rápido para o outro é a forma de lhe ganhar pontos.
 //  · Erra mais com bolas rápidas, com efeito e em jogadas longas (cansaço).
 // =========================================================================
-const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2, penAnt0: 0.12, penAntL: 0.012, penAntMax: 0.35, penRead0: 0.25, penReadL: 0.02, penReadMax: 0.55, penReady: 0, penSpd0: 0.9, penSpdL: 0.01, penSpdMax: 1.05, penErr0: 1.8, penErrL: 0.03, penErrMin: 1.3, penShotMin: 2.8, penShotCap: 3.9, roundAI: 0.55, roundAnt: 0.35 };   // calibração por comprimento do túnel
+const TUN = { speedExp: 0.75, aiExp: 0.4, antL0: 0.06, antL: 0.036, antMax: 0.8, aceRun: 0.25, antBoost: 1.2, penAnt0: 0.12, penAntL: 0.012, penAntMax: 0.35, penRead0: 0.25, penReadL: 0.02, penReadMax: 0.55, penReady: 0, penSpd0: 0.9, penSpdL: 0.01, penSpdMax: 1.05, penErr0: 1.8, penErrL: 0.03, penErrMin: 1.3, penShotMin: 2.6, penShotCap: 3.9, roundAI: 0.55, roundAnt: 0.35 };   // calibração por comprimento do túnel
 // depois do nível 22 (onde tudo atinge o máximo) a dificuldade continua a subir devagar, sem limite
 const OVR = L => Math.max(0, L - 22);
 const AI = {
@@ -1329,7 +1349,7 @@ function aiPlan(fresh, isServe) {
   const pL = predictFor({ ...ball, cx: 0, cy: 0 });
   const pC = predictFor(ball);
   const prog = SQUASH ? clamp((ball.vz > 0 ? ball.z : 2 * TD - ball.z) / (2 * TD - SQZ), 0, 1) : clamp(ball.z / TD, 0, 1);                   // a curva torna-se evidente à medida que a bola avança
-  const k = op.read ? 1 : clamp(sk * 0.35 + (op.fam || 0) * 0.45 + (1 - sk * 0.35) * prog * prog * 0.45, 0, 1);
+  const k = op.read ? 1 : clamp(sk * 0.35 + (op.fam || 0) * 0.45 + (1 - sk * 0.35) * prog * prog * 0.45 + 0.15 * tempoSkill(), 0, 1);   // técnicos: lê melhor os efeitos
   if (fresh) {
     // erro fixo por bola: maior com bola rápida, com muito efeito e em jogadas longas
     const sp = Math.abs(ball.vz) / 2.2, spin = Math.hypot(ball.cx, ball.cy) / CMAX;
@@ -1338,13 +1358,14 @@ function aiPlan(fresh, isServe) {
     // o erro depende da QUALIDADE da bola (velocidade, efeito, colocação): bolas fracas são sempre devolvidas
     const e = ((0.02 + 0.13 * (1 - sk)) * (0.35 + 0.55 * sp + 0.85 * spin) + 0.01 * Math.max(0, Math.min(G.rally, 15) - 4)) * (1 + 1.5 * corner);
     const eS = SQUASH ? e * 1.7 : e;
-    op.ex = rnd(-eS, eS); op.ey = rnd(-eS, eS) * 0.8;
+    const tsk = 1 - 0.25 * tempoSkill();            // níveis técnicos: adversário mais certeiro
+    op.ex = rnd(-eS, eS) * tsk; op.ey = rnd(-eS, eS) * 0.8 * tsk;
     // squash: mais errático — às vezes lê mal a bola que volta da parede
     if (SQUASH && Math.random() < 0.05 + 0.008 * Math.min(G.rally, 10)) op.ex += (Math.random() < 0.5 ? -1 : 1) * rnd(0.3, 0.5);
     // de vez em quando lê mal a bola (mesmo uma bola simples): as jogadas não se eternizam
     if (G.rally > 6 && Math.random() < 0.006 * (Math.min(G.rally, 20) - 6)) {   // só o cansaço em jogadas longas
       op.ex += (Math.random() < 0.5 ? -1 : 1) * rnd(0.28, 0.45); }
-    op.react = AI.react(L) * Math.sqrt(TD / TD_BASE) * (SQUASH ? 1.4 : 1);   // túnel curto: reage mais depressa
+    op.react = AI.react(L) * Math.sqrt(TD / TD_BASE) * (SQUASH ? 1.4 : 1) / SR(L);   // bola mais lenta → tempos do adversário à mesma escala   // túnel curto: reage mais depressa
     // serviço: quanto mais alto o nível, mais vezes "lê" o serviço logo à partida (arranca já para o lado certo)
     op.read = isServe && Math.random() < (PENALTY && G.server !== 'op'
       ? Math.min(TUN.penRead0 + TUN.penReadL * (L - 1), TUN.penReadMax)       // penáltis: lê pior o teu remate
@@ -1374,8 +1395,9 @@ function aiUpdate(dt) {
   const L = G.level;
   // túnel longo dá-lhe mais tempo → um pouco mais lento (e o contrário nos curtos): dificuldade parecida em todos
   const tdk = Math.pow(TD_BASE / TD, TUN.aiExp);
-  let vm = AI.vmax(L) * tdk * Math.max(0.8, 1 - 0.012 * Math.min(G.rally, 15));
-  let am = AI.amax(L) * tdk * (SQUASH ? 0.8 : 1);
+  const sr = Math.pow(SR(L), 0.8);                 // um pouco menos lento do que a bola (compensa a maior deriva dos efeitos)
+  let vm = AI.vmax(L) * sr * tdk * Math.max(0.8, 1 - 0.012 * Math.min(G.rally, 15));
+  let am = AI.amax(L) * sr * sr * tdk * (SQUASH ? 0.8 : 1);
   if (SQUASH) vm *= 0.8;
   if (ROUND) { vm *= TUN.roundAI; am *= TUN.roundAI; }   // túnel redondo: área menor → adversário mais lento (equilíbrio)
   // a receber o teu serviço: se adivinhou o serviço (op.antic), arranca muito mais depressa para lá
@@ -1617,6 +1639,7 @@ function update(dt) {
           G.mode = 'gameover'; G.overAt = performance.now(); sfx.over();
         } else if (G.after === 'level') {
           G.level++; G.opp = 3; G.pm = 0; G.po = 0; G.levelLosses = 0;
+          G.tempo = pickTempo(G.level);           // andamento do novo nível (rápido, médio ou técnico)
           // nível concluído: +1 bola (para prolongar o jogo)
           if (G.lives < MAX_LIVES) { G.lives++; pop('NÍVEL CONCLUÍDO · +1 BOLA', '#7fd4ff'); setTimeout(() => sfx.extra(), 450); }
           // novo comprimento de túnel, diferente do atual
@@ -1880,7 +1903,7 @@ function tgScore() {
 }
 const TM = { kind: '', t: 0, total: 0, tick: 0 };
 const tmServeTime = () => TARGET ? 5 : Math.max(2.2, 3 - 0.03 * (G.level - 1));   // tiro ao alvo: 5 s para cada remate
-const tmPointTime = () => Math.max(6, 10 - 0.15 * (G.level - 1)) * Math.pow(TD / TD_BASE, 0.4);   // túneis longos: mais tempo
+const tmPointTime = () => Math.max(6, 10 - 0.15 * (G.level - 1)) * Math.pow(TD / TD_BASE, 0.4) / Math.pow(SR(G.level), 0.7);   // jogo mais lento: um pouco mais de tempo   // túneis longos: mais tempo
 // granada (modo cronometrado): explosão com bola de fogo, estilhaços e fumo
 const EXP = { on: false, t: 0, x: 0, y: 0, z: 0, parts: [] };
 function boomGrenade() {
@@ -3511,7 +3534,7 @@ function frame(now) {
 }
 requestAnimationFrame(frame);
 
-window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setDisco: v => { DISCO = v; }, DSC, setTimed: v => { TIMED = v; }, TM, EXP, boomGrenade, setTarget: v => { TARGET = v; tgReset(); }, TG, setRound: v => { ROUND = v; }, predictArrival, setMach: v => { MACH = v; mcReset(); }, setNextMode: i => { FORCE_NEXT = i; }, MC, mcNeed, tgCurveK, tgR, tgNeed, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
+window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setDisco: v => { DISCO = v; }, DSC, setTimed: v => { TIMED = v; }, TM, EXP, boomGrenade, setTarget: v => { TARGET = v; tgReset(); }, TG, setRound: v => { ROUND = v; }, predictArrival, setMach: v => { MACH = v; mcReset(); }, setNextMode: i => { FORCE_NEXT = i; }, lvSpeed, SR, pickTempo, MC, mcNeed, tgCurveK, tgR, tgNeed, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
 })();
 </script>
 </body>

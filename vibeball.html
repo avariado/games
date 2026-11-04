@@ -156,6 +156,7 @@ const NO_LOCK = /nolock/.test(location.search);   // ?nolock desativa o bloqueio
 const QS = new URLSearchParams(location.search);
 const FORCE_MODE = QS.get('modo') || null;
 const START_LEVEL = Math.max(1, parseInt(QS.get('nivel')) || 1);
+let FORCE_NEXT = null;   // (testes) força o modo do próximo nível
 const FORCE_IDX = { squash: 0, penaltis: 1, rede: 2, disco: 3, crono: 4, alvo: 5, redondo: 6, maquina: 7 }[FORCE_MODE];
 const MOUSE_GAIN = 1.15, MOUSE_SENS = 1.1;
 function requestLock() {
@@ -1606,7 +1607,7 @@ function update(dt) {
           ballHueTarget = newBallHue(ballHueTarget);
           themePending = newTheme(themeIdx);
           // modos especiais, todos com a mesma frequência (≈9,4% cada); os restantes 25% são ténis normal
-          const mi = FORCE_IDX !== undefined ? FORCE_IDX : Math.floor(Math.random() / (0.75 / 8));   // 0 squash · 1 penáltis · 2 rede · 3 discoteca · 4 cronometrado · 5 alvo · 6 redondo · 7 lança-bolas · ≥8 normal
+          const mi = FORCE_IDX !== undefined ? FORCE_IDX : FORCE_NEXT !== null ? FORCE_NEXT : Math.floor(Math.random() / (0.75 / 8));   // 0 squash · 1 penáltis · 2 rede · 3 discoteca · 4 cronometrado · 5 alvo · 6 redondo · 7 lança-bolas · ≥8 normal
           squashPending = mi === 0 && (G.level >= 3 || FORCE_IDX === 0);      // squash só a partir do nível 3 (antes disso, nível normal)
           penPending = mi === 1;
           netPending = mi === 2 ? { top: TY - rnd(0.36, 0.5) } : null;
@@ -1624,6 +1625,7 @@ function update(dt) {
           if (PENALTY) { PEN.turn = 'me'; PEN.netBall = false; }
           G.nextServer = 'me';
           toServe();
+          if (machPending) ball.visible = false;   // vai começar o lança-bolas: nada de bola parada no centro
         } else if (G.after === 'pen') {
           const w = penWinner();
           if (w === 'me') {                      // ganhaste a série: passa de nível (mesmo caminho que um jogo ganho)
@@ -1684,7 +1686,9 @@ function update(dt) {
     const u = Math.min(1, G.warp.t / G.warp.dur);
     G.warpPhase = G.warp.A * (1 - Math.cos(Math.PI * u)) / 2;
     G.warpGlow = Math.sin(Math.PI * u);
-    if (u >= 0.5 && themePending !== null) { themeIdx = themePending; themePending = null; NET = netPending; netPending = undefined; SQUASH = squashPending; PENALTY = penPending; if (PENALTY) penReset(); DISCO = discoPending; TIMED = timedPending; TM.kind = ''; TARGET = targetPending; tgReset(); ROUND = roundPending; MACH = machPending; mcReset(); }
+    if (u >= 0.5 && themePending !== null) { themeIdx = themePending; themePending = null; NET = netPending; netPending = undefined; SQUASH = squashPending; PENALTY = penPending; if (PENALTY) penReset(); DISCO = discoPending; TIMED = timedPending; TM.kind = ''; TARGET = targetPending; tgReset(); ROUND = roundPending; MACH = machPending; mcReset();
+      if (G.mode === 'serve') toServe();   // o modo mudou a meio da viagem: refaz o serviço já com as regras do novo modo (bola, quem serve)
+    }
     if (u >= 0.5 && visPending !== null) { visIdx = visPending; visPending = null; glitch.timer = rnd(15, 30); }   // troca de cenário no auge do clarão
     if (u >= 1) { G.warp = null; G.warpPhase = 0; G.warpGlow = 0; }
   }
@@ -3489,7 +3493,7 @@ function frame(now) {
 }
 requestAnimationFrame(frame);
 
-window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setDisco: v => { DISCO = v; }, DSC, setTimed: v => { TIMED = v; }, TM, EXP, boomGrenade, setTarget: v => { TARGET = v; tgReset(); }, TG, setRound: v => { ROUND = v; }, predictArrival, setMach: v => { MACH = v; mcReset(); }, MC, mcNeed, tgCurveK, tgR, tgNeed, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
+window.__curveball = { TUN, G, ball, me, op, input, AI, rigMe, rigOp, sd: strokeDelta, glitch, startGlitch, setTheme: i => { themeIdx = i; }, PEN, penWinner, penResult, setDisco: v => { DISCO = v; }, DSC, setTimed: v => { TIMED = v; }, TM, EXP, boomGrenade, setTarget: v => { TARGET = v; tgReset(); }, TG, setRound: v => { ROUND = v; }, predictArrival, setMach: v => { MACH = v; mcReset(); }, setNextMode: i => { FORCE_NEXT = i; }, MC, mcNeed, tgCurveK, tgR, tgNeed, setPenalty: v => { PENALTY = v; penReset(); }, setSquash: v => { SQUASH = v; }, tryBoomerang, setNet: n => { NET = n; }, MX, startMatrix, LOCK, setVis: i => { visIdx = i; }, shotMemory, observe: aiObserve, step: update, setTD: d => { TD = TD_TARGET = d; }, audio: () => ({ hit: !!HITBUF, ok: !!SWOOSH, peak: SW_PEAK, dur: SWOOSH ? SWOOSH.duration : 0 }) };
 })();
 </script>
 </body>

@@ -270,7 +270,7 @@ window.addEventListener('keydown', e => {
     if (G.mode === 'play' || G.mode === 'serve' || G.mode === 'miss') G.paused = !G.paused;
   } else if (k === 'm') {
     setMuted(!G.muted);
-  } else if (k === ' ') {
+  } else if (k === ' ' || k === 'x' || k === 'enter') {   // bater: Espaço, X ou Enter
     e.preventDefault();
     unlockAudio();
     if (G.mode === 'serve' && G.server !== 'op' && !G.paused) serve();
